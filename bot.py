@@ -142,14 +142,6 @@ def render_order(o, admin=False, reveal=False):
     ]
     for f in config.FORM_FIELDS:
         lines.append(f"{esc(f['label'])}: {esc(field_text(f, data.get(f['key']), reveal))}")
-    if not admin:
-        recs = db.list_order_receipts(o["id"])
-        if recs:
-            lines += ["", "🧾 رسیدهای شما:"]
-            for r in recs:
-                amt = f" | {r['amount']:,} ریال" if r["status"] == "approved" else ""
-                lines.append(f"#{r['id']} | {fmt_time(r['created_at'])} | {RECEIPT_CUSTOMER[r['status']]}{amt}")
-    
     if admin:
         uname = f"@{o['username']}" if o["username"] else "—"
         if o["status"] == "done":
@@ -377,16 +369,16 @@ def fin_view(uid):
                 f"🔖 <code>{esc(r['code'])}</code> | {esc(sym)}\n"
                 f"   کارمزد: {fee_txt}"
             )
-            if r["status"] == "done" and f["balance"] > 0 and len(kb) < 8:
-                kb.append([B(f"🧾 ارسال رسید {r['code']}", callback_data=f"rc:{r['id']}")])
+    pending = db.count_pending_receipts(user_id=uid)
+    if bal > 0 and pending == 0:
+        kb.append([B(f"🧾 ارسال رسید پرداخت کل بدهی ({bal:,} ریال)", callback_data="rc:all")])
     if recs:
-        lines += ["", "<b>پیگیری رسیدها</b>"]
+        lines += ["", "<b>پیگیری پرداخت کل حساب</b>"]
         for r in recs:
             amt = f" | {r['amount']:,} ریال" if r["status"] == "approved" else ""
-            lines.append(
-                f"#{r['id']} | <code>{esc(r['code'])}</code> | {fmt_time(r['created_at'])} | "
-                f"{RECEIPT_CUSTOMER[r['status']]}{amt}"
-            )
+            lines.append(f"#{r['id']} | {fmt_time(r['created_at'])} | {RECEIPT_CUSTOMER[r['status']]}{amt}")
+    if pending:
+        lines += ["", "⏳ یک رسید شما در انتظار بررسی است؛ پس از اعلام نتیجه می‌توانید رسید دیگری ارسال کنید."]
     kb.append([B("🔄 به‌روزرسانی", callback_data="fin")])
     return "\n".join(lines), M(kb)
 
@@ -625,16 +617,15 @@ RECEIPT_CUSTOMER = {"pending": "⏳ در انتظار بررسی", "approved": "
 
 
 async def notify_receipt(ctx, rid, only=None):
-    """ارسال رسید پرداخت (با دکمه‌ی تأیید/رد) برای مالک‌ها."""
+    """ارسال رسید پرداخت کل حساب برای مالک‌ها."""
     r = db.get_receipt(rid)
     o = db.get_order(r["order_id"])
     d = json.loads(o["data"])
-    fee = db.order_fees(o)
+    summary = db.customer_summary(o)
     lines = [
-        f"🧾 <b>رسید پرداخت #{rid}</b>",
-        f"سفارش: <code>{esc(o['code'])}</code>",
+        f"🧾 <b>رسید پرداخت کل حساب #{rid}</b>",
         f"مشتری: {esc(d.get('full_name') or '—')} | {esc(d.get('phone') or '—')}",
-        f"کارمزد (بدهی): {fee['commission']:,} | دریافتی: {fee['paid']:,} | مانده: {fee['balance']:,} ریال",
+        f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} ریال",
     ]
     if r["text"]:
         lines.append(f"شماره پیگیری / توضیح: {esc(r['text'][:200])}")
@@ -662,13 +653,24 @@ async def notify_receipt(ctx, rid, only=None):
 async def submit_receipt(update, ctx, kind, file_id=None, file_uid=None, text=None):
     uid = update.effective_user.id
     st = ctx.user_data.get("state")
-    o = db.get_order(st[1])
+    if not st or st[0] != "receipt" or st[1] != uid:
+        ctx.user_data.clear()
+        return await update.message.reply_text("درخواست ارسال رسید معتبر نیست؛ از وضعیت مالی اقدام کنید.", reply_markup=main_kb(uid))
+    summary = db.user_finance(uid)
+    if summary["balance"] <= 0:
+        ctx.user_data.clear()
+        return await update.message.reply_text("در حال حاضر بدهی پرداخت‌نشده‌ای ندارید.", reply_markup=main_kb(uid))
+    if db.count_pending_receipts(user_id=uid):
+        ctx.user_data.clear()
+        return await update.message.reply_text("یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.", reply_markup=main_kb(uid))
+    completed = [r for r, _ in summary["items"] if r["status"] == "done"]
+    if not completed:
+        ctx.user_data.clear()
+        return await update.message.reply_text("سفارش تکمیل‌شده‌ای برای ثبت پرداخت وجود ندارد.", reply_markup=main_kb(uid))
     ctx.user_data.clear()
-    if not o or o["user_id"] != uid or o["status"] == config.INACTIVE_STATUS:
-        return await update.message.reply_text("سفارش پیدا نشد.", reply_markup=main_kb(uid))
-    rid = db.add_receipt(o["id"], uid, kind, file_id, file_uid, text)
+    rid = db.add_receipt(completed[0]["id"], uid, kind, file_id, file_uid, text)
     await update.message.reply_text(
-        "✅ رسید شما دریافت شد و برای بررسی ارسال شد. بعد از تأیید، به شما اطلاع داده می‌شود.",
+        "✅ رسید پرداخت کل بدهی شما دریافت شد و برای بررسی ارسال شد. پس از تأیید مدیر، مانده حساب به‌روزرسانی می‌شود.",
         reply_markup=main_kb(uid),
     )
     await notify_receipt(ctx, rid)
@@ -678,18 +680,18 @@ async def finish_approval(msg, ctx, rid, amount, uid):
     res = db.approve_receipt(rid, amount, uid)
     if not res:
         return await msg.reply_text("این رسید قبلاً بررسی شده است.")
-    txt = (
-        f"✅ رسید #{rid} تأیید شد.\nسفارش: {res['code']}\n"
+    label = "بدهکار" if res["balance"] > 0 else "بستانکار" if res["balance"] < 0 else "تسویه"
+    await msg.reply_text(
+        f"✅ رسید پرداخت کل حساب #{rid} تأیید شد.\n"
         f"مبلغ ثبت‌شده: {amount:,} ریال\n"
-        f"دریافتی کل این سفارش: {res['paid']:,} ریال\n"
-        f"مانده: {abs(res['balance']):,} ریال "
-        f"({'بدهکار' if res['balance'] > 0 else 'بستانکار' if res['balance'] < 0 else 'تسویه'})"
+        f"جمع پرداختی‌های مشتری: {res['paid']:,} ریال\n"
+        f"مانده کل حساب: {abs(res['balance']):,} ریال ({label})"
     )
-    kb = M([[B("💳 پرداخت و کارمزد", callback_data=f"a:pay:{res['order_id']}")]])
-    await msg.reply_text(txt, reply_markup=kb)
     try:
         await ctx.bot.send_message(
-            res["user_id"], f"✅ پرداخت شما برای سفارش {res['code']} تأیید شد.\nمبلغ ثبت‌شده: {amount:,} ریال"
+            res["user_id"],
+            f"✅ پرداخت کل بدهی شما تأیید شد.\nمبلغ ثبت‌شده: {amount:,} ریال\n"
+            f"مانده حساب: {abs(res['balance']):,} ریال ({label})",
         )
     except TelegramError:
         pass
@@ -1095,26 +1097,26 @@ async def admin_cb(q, ctx, p):
         if r["status"] != "pending":
             return await q.message.reply_text(f"این رسید قبلاً {RECEIPT_LABELS[r['status']]} شده است.")
         o = db.get_order(r["order_id"])
-        fee = db.order_fees(o)
+        summary = db.customer_summary(o)
         if act == "rca":
             rows = []
-            if fee["balance"] > 0:
-                rows.append([B(f"✅ ثبت مبلغ مانده ({fee['balance']:,} ریال)", callback_data=f"a:rcf:{rid}")])
+            if summary["balance"] > 0:
+                rows.append([B(f"✅ ثبت کل مانده ({summary['balance']:,} ریال)", callback_data=f"a:rcf:{rid}")])
             rows.append([B("✏️ مبلغ دیگر", callback_data=f"a:rcm:{rid}")])
             await q.message.reply_text(
-                f"تأیید رسید #{rid} — سفارش {o['code']}\n"
-                f"کارمزد (بدهی): {fee['commission']:,} | دریافتی: {fee['paid']:,} | مانده: {fee['balance']:,} ریال\n\n"
+                f"تأیید رسید کل حساب #{rid}\n"
+                f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} ریال\n\n"
                 "چه مبلغی از این رسید ثبت شود؟",
                 reply_markup=M(rows),
             )
         elif act == "rcf":
-            if fee["balance"] <= 0:
-                return await q.message.reply_text("مانده‌ای برای ثبت وجود ندارد؛ «مبلغ دیگر» را بزنید.")
+            if summary["balance"] <= 0:
+                return await q.message.reply_text("مانده کل حساب صفر یا منفی است؛ «مبلغ دیگر» را بزنید.")
             try:
                 await q.edit_message_reply_markup(None)
             except TelegramError:
                 pass
-            await finish_approval(q.message, ctx, rid, fee["balance"], uid)
+            await finish_approval(q.message, ctx, rid, summary["balance"], uid)
         elif act == "rcm":
             ctx.user_data["state"] = ("a_rc_amount", rid)
             await q.message.reply_text(
@@ -1553,10 +1555,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         o = db.get_order(int(d[3:]))
         # مشتری فقط سفارش خودش را می‌بیند
         if o and o["user_id"] == uid:
-            kb = None
-            if o["status"] == "done":
-                kb = M([[B("🧾 ارسال رسید پرداخت", callback_data=f"rc:{o['id']}")]])
-            await q.message.reply_text(render_order(o), parse_mode="HTML", reply_markup=kb)
+            await q.message.reply_text(render_order(o), parse_mode="HTML")
         return
 
     if d == "fin":
@@ -1565,20 +1564,19 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = fin_view(uid)
         return await show(q, text, kb)
 
-    if d.startswith("rc:"):
+    if d == "rc:all":
         if is_admin(uid):
             return
-        o = db.get_order(int(d[3:]))
-        if not o or o["user_id"] != uid or o["status"] != "done":
-            return
-        if db.count_pending_receipts(user_id=uid) >= config.MAX_PENDING_RECEIPTS:
-            return await q.message.reply_text(
-                "چند رسید شما هنوز در انتظار بررسی است. لطفاً تا اعلام نتیجه صبر کنید."
-            )
+        summary = db.user_finance(uid)
+        if summary["balance"] <= 0:
+            return await q.message.reply_text("در حال حاضر بدهی پرداخت‌نشده‌ای ندارید.")
+        if db.count_pending_receipts(user_id=uid):
+            return await q.message.reply_text("یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.")
         ctx.user_data.clear()
-        ctx.user_data["state"] = ("receipt", o["id"])
+        ctx.user_data["state"] = ("receipt", uid)
         return await q.message.reply_text(
-            f"🧾 سفارش {o['code']}\n\nعکس یا فایل (PDF) رسید پرداخت را بفرستید؛ "
+            f"🧾 ارسال رسید پرداخت کل حساب\nمبلغ بدهی فعلی: {summary['balance']:,} ریال\n\n"
+            "عکس یا فایل (PDF) رسید پرداخت کل بدهی را بفرستید؛ "
             "می‌توانید شماره پیگیری را در توضیح (کپشن) بنویسید.\n"
             "اگر عکس ندارید، فقط شماره پیگیری بانکی را به‌صورت متن بفرستید.",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
