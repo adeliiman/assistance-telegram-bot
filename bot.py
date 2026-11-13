@@ -706,7 +706,7 @@ async def finish_approval(msg, ctx, rid, amount, uid):
 
 ACT_PERM = {
     "home": "view", "l": "view", "o": "view", "search": "view", "hist": "view",
-    "users": "view", "usr": "view", "uhist": "view",
+    "users": "view", "usr": "view", "uhist": "view", "upay": "pay",
     "s": "status", "e": "edit", "ef": "edit", "n": "note",
     "pay": "pay", "pa": "pay", "inv": "pay",
     "rca": "pay", "rcf": "pay", "rcm": "pay", "rcr": "pay", "rcl": "pay",
@@ -718,7 +718,7 @@ ACT_PERM = {
     "rt": "rates", "rte": "rates", "rtn": "rates",
 }  # fmt: skip
 STATE_PERM = {
-    "a_search": "view", "a_edit": "edit", "a_note": "note", "a_paid": "pay", "a_rc_amount": "pay",
+    "a_search": "view", "a_edit": "edit", "a_note": "note", "a_paid": "pay", "a_user_paid": "pay", "a_rc_amount": "pay",
     "a_symrate": "rates",
     "a_cap_set": "cap", "a_rate": "cap", "a_faq_add_q": "faq", "a_faq_add_a": "faq",
     "a_faq_edit": "faq", "a_restore": "backup", "a_restore_confirm": "backup",
@@ -903,45 +903,44 @@ async def admin_cb(q, ctx, p):
         await show(q, head, M(kb))
 
     elif act == "users":
-        page = max(0, int(p[1]) if len(p) > 1 else 0)
-        rows, total = db.list_users(PAGE, page * PAGE, exclude=all_staff())
-        kb = []
-        lines = []
-        page_debt = page_paid = page_balance = 0
-        for user in rows:
+        filter_key = p[1] if len(p) > 1 and p[1] in ("all", "debtors", "pending") else "all"
+        page = max(0, int(p[2]) if len(p) > 2 else (int(p[1]) if len(p) > 1 and p[1].isdigit() else 0))
+        all_rows, _ = db.list_users(100000, 0, exclude=all_staff())
+        eligible = []
+        for user in all_rows:
             finance = db.user_finance(user["user_id"])
-            debt, paid, bal = finance["debt"], finance["paid"], finance["balance"]
-            page_debt += debt
-            page_paid += paid
-            page_balance += bal
+            pending = db.count_pending_receipts(user_id=user["user_id"])
+            if filter_key == "debtors" and finance["balance"] <= 0:
+                continue
+            if filter_key == "pending" and not pending:
+                continue
+            eligible.append((user, finance, pending))
+        total = len(eligible)
+        rows = eligible[page * PAGE:(page + 1) * PAGE]
+        kb = [
+            [B("همه کاربران", callback_data="a:users:all:0"),
+             B("فقط بدهکارها", callback_data="a:users:debtors:0")],
+            [B("رسیدهای در انتظار", callback_data="a:users:pending:0")],
+        ]
+        for user, finance, pending in rows:
+            bal = finance["balance"]
             label = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
             username = f"@{user['username']}" if user["username"] else f"ID {user['user_id']}"
-            pending = db.count_pending_receipts(user_id=user["user_id"])
-            receipt_mark = " 🧾 رسید در انتظار بررسی" if pending else ""
-            lines.append(
-                f"👤 <b>{esc(username)}</b>\n"
-                f"   بدهی: {debt:,} | پرداختی: {paid:,} ریال\n"
-                f"   مانده: <b>{abs(bal):,} ریال ({label})</b>{receipt_mark}"
-            )
+            receipt_mark = " 🧾" if pending else ""
             kb.append([B(
-                f"مشاهده پرونده {username}",
+                f"{username} | {abs(bal):,} ریال ({label}){receipt_mark}",
                 callback_data=f"a:usr:{user['user_id']}",
             )])
         nav = []
         if page > 0:
-            nav.append(B("◀️ قبلی", callback_data=f"a:users:{page - 1}"))
+            nav.append(B("◀️ قبلی", callback_data=f"a:users:{filter_key}:{page - 1}"))
         if (page + 1) * PAGE < total:
-            nav.append(B("بعدی ▶️", callback_data=f"a:users:{page + 1}"))
+            nav.append(B("بعدی ▶️", callback_data=f"a:users:{filter_key}:{page + 1}"))
         if nav:
             kb.append(nav)
         kb.append([B("🏠 پنل مدیریت", callback_data="a:home")])
-        heading = (
-            f"👥 <b>کاربران و وضعیت حساب‌ها</b>\n"
-            f"تعداد کل: {total} | صفحه {page + 1}\n"
-            f"جمع این صفحه — بدهی: {page_debt:,} | پرداختی: {page_paid:,} | مانده: {page_balance:,} ریال"
-        )
-        body = "\n\n".join(lines) if lines else "هنوز مشتری‌ای ثبت نشده است."
-        await show(q, heading + "\n\n" + body, M(kb))
+        title = {"all": "همه کاربران", "debtors": "فقط بدهکارها", "pending": "رسیدهای در انتظار"}[filter_key]
+        await show(q, f"👥 <b>{title}</b>\nتعداد: {total}\nصفحه {page + 1}", M(kb))
 
     elif act == "usr":
         user_id = int(p[1])
@@ -994,7 +993,9 @@ async def admin_cb(q, ctx, p):
             done = next((r for r in orders if r["status"] == "done"), None)
             if done and can(uid, "pay"):
                 kb.append([B("📨 ارسال صورتحساب کل", callback_data=f"a:inv:{done['id']}")])
-        kb.append([B("⬅️ فهرست کاربران", callback_data="a:users:0")])
+        if can(uid, "pay"):
+            kb.append([B("➕ ثبت پرداخت دستی برای کل حساب", callback_data=f"a:upay:{user_id}")])
+        kb.append([B("⬅️ فهرست کاربران", callback_data="a:users:all:0")])
         await show(q, "\n".join(lines), M(kb))
 
     elif act == "uhist":
@@ -1152,6 +1153,17 @@ async def admin_cb(q, ctx, p):
         await show(q, text, M(kb))
 
     # ---- payment & commission ----
+    elif act == "upay":
+        user_id = int(p[1])
+        finance = db.user_finance(user_id)
+        ctx.user_data["state"] = ("a_user_paid", user_id)
+        await q.message.reply_text(
+            f"ثبت پرداخت دستی برای کل حساب مشتری\n"
+            f"مانده فعلی: {abs(finance['balance']):,} ریال\n"
+            "مبلغ پرداخت‌شده را به ریال و فقط با عدد بفرستید:",
+            reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
+        )
+
     elif act == "pay":
         o = db.get_order(int(p[1]))
         if not o:
@@ -1525,6 +1537,27 @@ async def admin_text(update, ctx, raw, st):
         db.faq_update(st[1], st[2], raw)
         ctx.user_data.clear()
         await msg.reply_text("ذخیره شد ✅", reply_markup=main_kb(uid))
+
+    elif kind == "a_user_paid":
+        v = fa2en(raw).replace(",", "").replace(" ", "")
+        if not v.isdigit() or not 0 < int(v) <= 10**13:
+            return await msg.reply_text("لطفاً مبلغ مثبت و معتبر را به ریال وارد کنید.")
+        user_id = st[1]
+        db.add_manual_customer_payment(user_id, int(v), uid, "ثبت دستی توسط مدیر")
+        ctx.user_data.clear()
+        finance = db.user_finance(user_id)
+        bal = finance["balance"]
+        label = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
+        await msg.reply_text(
+            f"پرداخت دستی {int(v):,} ریال ثبت شد.\n"
+            f"جمع پرداختی‌ها: {finance['paid']:,} ریال\n"
+            f"مانده کل: {abs(bal):,} ریال ({label})",
+            reply_markup=main_kb(uid),
+        )
+        await msg.reply_text(
+            "پرونده مالی مشتری:",
+            reply_markup=M([[B("مشاهده پرونده", callback_data=f"a:usr:{user_id}")]]),
+        )
 
     elif kind == "a_paid":
         v = fa2en(raw).replace(",", "").replace(" ", "")
