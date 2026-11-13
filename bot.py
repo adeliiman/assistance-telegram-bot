@@ -162,9 +162,9 @@ def render_order(o, admin=False, reveal=False):
             for r, level in sims[:5]:
                 tag = "🔴 سفارش تکراری" if level == "exact" else "🟠 سفارش مشابه"
                 lines.append(f"{tag}: <code>{esc(r['code'])}</code> ({fmt_time(r['created_at'])})")
-        npend = db.count_pending_receipts(order_id=o["id"])
+        npend = db.count_pending_receipts(user_id=o["user_id"])
         if npend:
-            lines.append(f"🧾 رسید در انتظار بررسی: {npend}")
+            lines.append(f"🧾 رسید پرداخت کل حساب در انتظار بررسی: {npend}")
         notes = db.list_notes(o["id"])
         if notes:
             total = db.count_notes(o["id"])
@@ -537,8 +537,8 @@ def order_kb(o, uid):
         act_row.append(B("📝 یادداشت", callback_data=f"a:n:{o['id']}"))
     if act_row:
         rows.append(act_row)
-    if can(uid, "pay") and db.count_pending_receipts(order_id=o["id"]):
-        rows.append([B("🧾 بررسی رسیدهای در انتظار", callback_data=f"a:rcl:{o['id']}")])
+    if can(uid, "pay") and db.count_pending_receipts(user_id=o["user_id"]):
+        rows.append([B("🧾 بررسی رسید کل حساب", callback_data=f"a:rcl:{o['user_id']}")])
     info_row = [B("👤 سابقه مشتری", callback_data=f"a:hist:{o['id']}")]
     if can(uid, "pay"):
         info_row.insert(0, B("💳 پرداخت و فاکتور", callback_data=f"a:pay:{o['id']}"))
@@ -621,7 +621,7 @@ async def notify_receipt(ctx, rid, only=None):
     r = db.get_receipt(rid)
     o = db.get_order(r["order_id"])
     d = json.loads(o["data"])
-    summary = db.customer_summary(o)
+    summary = db.user_finance(r["user_id"])
     lines = [
         f"🧾 <b>رسید پرداخت کل حساب #{rid}</b>",
         f"مشتری: {esc(d.get('full_name') or '—')} | {esc(d.get('phone') or '—')}",
@@ -668,7 +668,13 @@ async def submit_receipt(update, ctx, kind, file_id=None, file_uid=None, text=No
         ctx.user_data.clear()
         return await update.message.reply_text("سفارش تکمیل‌شده‌ای برای ثبت پرداخت وجود ندارد.", reply_markup=main_kb(uid))
     ctx.user_data.clear()
-    rid = db.add_receipt(completed[0]["id"], uid, kind, file_id, file_uid, text)
+    try:
+        rid = db.add_receipt(completed[0]["id"], uid, kind, file_id, file_uid, text)
+    except ValueError:
+        return await update.message.reply_text(
+            "یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.",
+            reply_markup=main_kb(uid),
+        )
     await update.message.reply_text(
         "✅ رسید پرداخت کل بدهی شما دریافت شد و برای بررسی ارسال شد. پس از تأیید مدیر، مانده حساب به‌روزرسانی می‌شود.",
         reply_markup=main_kb(uid),
@@ -1046,21 +1052,19 @@ async def admin_cb(q, ctx, p):
         if not o or o["status"] != "done":
             return await q.message.reply_text("برای این سفارش هنوز صورتحساب قابل ارسال نیست.")
 
-        # صورتحساب تجمیعی: تمام سفارش‌های تکمیل‌شده‌ی همین مشتری
-        customer_rows = [
-            row for row in db.customer_orders(o)
-            if row["status"] == "done"
-        ]
-        if not customer_rows:
+        # صورتحساب تجمیعی حساب تلگرام مشتری؛ پرداخت‌های تأییدشده‌ی دفتر کل هم لحاظ می‌شوند.
+        finance = db.user_finance(o["user_id"])
+        completed_count = sum(1 for row, _ in finance["items"] if row["status"] == "done")
+        if not completed_count:
             return await q.message.reply_text("برای این مشتری سفارش تکمیل‌شده‌ای جهت صدور صورتحساب وجود ندارد.")
 
-        total_debt = sum(db.order_fees(row)["commission"] for row in customer_rows)
-        total_paid = sum(db.order_fees(row)["paid"] for row in customer_rows)
-        balance = total_debt - total_paid
+        total_debt = finance["debt"]
+        total_paid = finance["paid"]
+        balance = finance["balance"]
         balance_label = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
         invoice = (
             "🧾 <b>صورتحساب کل مشتری</b>\n"
-            f"تعداد سفارش‌های انجام‌شده: <b>{len(customer_rows)}</b>\n"
+            f"تعداد سفارش‌های انجام‌شده: <b>{completed_count}</b>\n"
             f"جمع کل بدهی (کارمزدها): <b>{total_debt:,} ریال</b>\n"
             f"جمع پرداختی‌ها: {total_paid:,} ریال\n"
             "━━━━━━━━━━━━━━\n"
@@ -1097,7 +1101,7 @@ async def admin_cb(q, ctx, p):
         if r["status"] != "pending":
             return await q.message.reply_text(f"این رسید قبلاً {RECEIPT_LABELS[r['status']]} شده است.")
         o = db.get_order(r["order_id"])
-        summary = db.customer_summary(o)
+        summary = db.user_finance(r["user_id"])
         if act == "rca":
             rows = []
             if summary["balance"] > 0:
@@ -1141,9 +1145,9 @@ async def admin_cb(q, ctx, p):
                 pass
 
     elif act == "rcl":
-        pend = db.list_pending_receipts(int(p[1]))
+        pend = db.list_pending_receipts(user_id=int(p[1]))
         if not pend:
-            return await q.message.reply_text("رسید در انتظاری برای این سفارش نیست.")
+            return await q.message.reply_text("رسید پرداخت در انتظاری برای این مشتری نیست.")
         for r in pend:
             await notify_receipt(ctx, r["id"], only=[uid])
 
@@ -1522,7 +1526,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not st or st[0] != "receipt":
         if not is_admin(uid):
             await update.message.reply_text(
-                "برای ارسال رسید، از «📋 سفارش‌های من» سفارش را باز کنید و «🧾 ارسال رسید پرداخت» را بزنید."
+                "برای ارسال رسید کل بدهی، از بخش «💰 وضعیت مالی من» اقدام کنید."
             )
         return
     ph = update.message.photo[-1]
