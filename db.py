@@ -675,7 +675,7 @@ def list_order_receipts(order_id, limit=5):
 
 
 def user_finance(user_id) -> dict:
-    """حساب مالی خودِ مشتری (فقط با همین آیدی تلگرام؛ سفارش‌های خطادار حساب نمی‌شوند)."""
+    """حساب مالی مشتری و سفارش‌های متصل به آیدی تلگرام یا شماره موبایل؛ سفارش‌های خطادار حساب نمی‌شوند."""
     rate = get_commission_percent()
     with conn() as c:
         account_ids = _account_user_ids(c, user_id)
