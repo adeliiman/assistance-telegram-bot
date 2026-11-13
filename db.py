@@ -437,13 +437,21 @@ def set_paid_amount(order_id, amount: int, actor_id):
 
 # ---------------- payment receipts ----------------
 def add_receipt(order_id, user_id, kind, file_id=None, file_uid=None, text=None) -> int:
+    """ثبت یک رسید برای کل حساب؛ هم‌زمان بیش از یک رسید معلق برای مشتری مجاز نیست."""
     with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        pending = c.execute(
+            "SELECT 1 FROM receipts WHERE user_id=? AND status='pending' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if pending:
+            raise ValueError("customer already has a pending receipt")
         cur = c.execute(
             "INSERT INTO receipts(order_id, user_id, kind, file_id, file_uid, text, created_at)"
             " VALUES(?,?,?,?,?,?,?)",
             (order_id, user_id, kind, file_id, file_uid, text, now()),
         )
-        _log(c, order_id, user_id, "receipt", f"#{cur.lastrowid} {kind}")
+        _log(c, order_id, user_id, "receipt", f"#{cur.lastrowid} account-wide {kind}")
         return cur.lastrowid
 
 
@@ -464,10 +472,11 @@ def count_pending_receipts(user_id=None, order_id=None) -> int:
         return c.execute(q, args).fetchone()[0]
 
 
-def list_pending_receipts(order_id):
+def list_pending_receipts(user_id):
+    """رسیدهای در انتظار بررسی برای کل حساب مشتری."""
     with conn() as c:
         return c.execute(
-            "SELECT * FROM receipts WHERE order_id=? AND status='pending' ORDER BY id", (order_id,)
+            "SELECT * FROM receipts WHERE user_id=? AND status='pending' ORDER BY id", (user_id,)
         ).fetchall()
 
 
