@@ -934,10 +934,12 @@ async def admin_cb(q, ctx, p):
             return await q.message.reply_text("کاربر پیدا نشد.")
         finance = db.user_finance(user_id)
         rows = [r for r, _ in finance["items"]]
-        orders = db.customer_orders(rows[0]) if rows else []
-        if not rows:
-            # کاربری که هنوز سفارش ندارد
-            orders = []
+        account_ids = db.account_user_ids(user_id)
+        orders = []
+        for account_id in account_ids:
+            found, _ = db.list_user_orders(account_id, 500, 0)
+            orders.extend(found)
+        orders.sort(key=lambda r: r["id"], reverse=True)
         profile = json.loads(orders[0]["data"]) if orders else {}
         name = profile.get("full_name") or "—"
         phone = profile.get("phone") or "—"
@@ -950,7 +952,9 @@ async def admin_cb(q, ctx, p):
             f"نام: {esc(name)}",
             f"موبایل: {esc(phone)}",
             f"شناسه تلگرام: <code>{user_id}</code>",
-            f"نام کاربری: @{esc(user['username'] or '—')}",
+            f"نام کاربری: {('@' + esc(user['username'])) if user['username'] else '—'}",
+            f"وضعیت دسترسی: {'مسدود' if user['blocked'] else 'فعال'}",
+            f"عضویت: {fmt_time(user['first_seen'])}",
             "",
             f"تعداد سفارش‌ها: {len(orders)}",
             f"جمع بدهی: <b>{finance['debt']:,} ریال</b>",
