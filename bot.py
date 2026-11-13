@@ -1057,11 +1057,11 @@ async def admin_cb(q, ctx, p):
         balance = total_debt - total_paid
         balance_label = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
         invoice = (
-            "🧾 <b>صورتحساب کل مشتری</b>\\n"
-            f"تعداد سفارش‌های انجام‌شده: <b>{len(customer_rows)}</b>\\n"
-            f"جمع کل بدهی (کارمزدها): <b>{total_debt:,} ریال</b>\\n"
-            f"جمع پرداختی‌ها: {total_paid:,} ریال\\n"
-            "━━━━━━━━━━━━━━\\n"
+            "🧾 <b>صورتحساب کل مشتری</b>\n"
+            f"تعداد سفارش‌های انجام‌شده: <b>{len(customer_rows)}</b>\n"
+            f"جمع کل بدهی (کارمزدها): <b>{total_debt:,} ریال</b>\n"
+            f"جمع پرداختی‌ها: {total_paid:,} ریال\n"
+            "━━━━━━━━━━━━━━\n"
             f"<b>مانده بدهی مشتری: {abs(balance):,} ریال ({balance_label})</b>"
         )
         try:
