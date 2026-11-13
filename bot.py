@@ -906,15 +906,25 @@ async def admin_cb(q, ctx, p):
         page = max(0, int(p[1]) if len(p) > 1 else 0)
         rows, total = db.list_users(PAGE, page * PAGE, exclude=all_staff())
         kb = []
+        lines = []
+        page_debt = page_paid = page_balance = 0
         for user in rows:
             finance = db.user_finance(user["user_id"])
-            bal = finance["balance"]
+            debt, paid, bal = finance["debt"], finance["paid"], finance["balance"]
+            page_debt += debt
+            page_paid += paid
+            page_balance += bal
             label = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
             username = f"@{user['username']}" if user["username"] else f"ID {user['user_id']}"
             pending = db.count_pending_receipts(user_id=user["user_id"])
-            receipt_mark = " 🧾" if pending else ""
+            receipt_mark = " 🧾 رسید در انتظار بررسی" if pending else ""
+            lines.append(
+                f"👤 <b>{esc(username)}</b>\n"
+                f"   بدهی: {debt:,} | پرداختی: {paid:,} ریال\n"
+                f"   مانده: <b>{abs(bal):,} ریال ({label})</b>{receipt_mark}"
+            )
             kb.append([B(
-                f"{username} | {abs(bal):,} ریال ({label}){receipt_mark}",
+                f"مشاهده پرونده {username}",
                 callback_data=f"a:usr:{user['user_id']}",
             )])
         nav = []
@@ -925,7 +935,13 @@ async def admin_cb(q, ctx, p):
         if nav:
             kb.append(nav)
         kb.append([B("🏠 پنل مدیریت", callback_data="a:home")])
-        await show(q, f"👥 <b>کاربران و وضعیت حساب‌ها</b>\nتعداد کل: {total}\nصفحه {page + 1}", M(kb))
+        heading = (
+            f"👥 <b>کاربران و وضعیت حساب‌ها</b>\n"
+            f"تعداد کل: {total} | صفحه {page + 1}\n"
+            f"جمع این صفحه — بدهی: {page_debt:,} | پرداختی: {page_paid:,} | مانده: {page_balance:,} ریال"
+        )
+        body = "\n\n".join(lines) if lines else "هنوز مشتری‌ای ثبت نشده است."
+        await show(q, heading + "\n\n" + body, M(kb))
 
     elif act == "usr":
         user_id = int(p[1])
