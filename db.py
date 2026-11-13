@@ -611,7 +611,11 @@ def approve_receipt(rid, amount: int, actor_id):
             f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})",
             account_ids,
         ).fetchone()[0]
-        paid = sums["legacy_paid"] + ledger
+        manual_ledger = c.execute(
+            f"SELECT COALESCE(SUM(amount),0) FROM manual_customer_payments WHERE user_id IN ({marks})",
+            account_ids,
+        ).fetchone()[0]
+        paid = sums["legacy_paid"] + ledger + manual_ledger
         return {"order_id":o["id"],"code":o["code"],"user_id":r["user_id"],
                 "paid":paid,"commission":sums["debt"],"balance":sums["debt"]-paid}
 
@@ -629,6 +633,26 @@ def reject_receipt(rid, actor_id):
         if cur.rowcount:
             _log(c, r["order_id"], actor_id, "receipt_rejected", f"#{rid}")
         return cur.rowcount > 0, r
+
+
+def list_account_payments(user_id, limit=5):
+    """آخرین پرداخت‌های تأییدشده و ثبت‌های دستی کل حساب."""
+    with conn() as c:
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
+        receipts = c.execute(
+            f"SELECT id, amount, status, created_at, 'receipt' AS source FROM receipts "
+            f"WHERE user_id IN ({marks}) AND status='approved'",
+            account_ids,
+        ).fetchall()
+        manual = c.execute(
+            f"SELECT id, amount, 'manual' AS status, created_at, 'manual' AS source "
+            f"FROM manual_customer_payments WHERE user_id IN ({marks})",
+            account_ids,
+        ).fetchall()
+    rows = sorted([dict(r) for r in receipts] + [dict(r) for r in manual],
+                  key=lambda r: r["created_at"], reverse=True)
+    return rows[:limit]
 
 
 def list_user_receipts(user_id, limit=10):
