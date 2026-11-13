@@ -559,7 +559,7 @@ def pay_kb(o):
     oid = o["id"]
     rows = []
     if o["status"] == "done":
-        rows.append([B("🧾 ارسال فاکتور برای مشتری", callback_data=f"a:inv:{oid}")])
+        rows.append([B("🧾 ارسال صورتحساب کل مشتری", callback_data=f"a:inv:{oid}")])
     rows.append([B("💰 ثبت مبلغ دریافتی", callback_data=f"a:pa:{oid}")])
     rows.append([B("⬅️ سفارش", callback_data=f"a:o:{oid}")])
     return M(rows)
@@ -1042,21 +1042,46 @@ async def admin_cb(q, ctx, p):
         oid = int(p[1])
         o = db.get_order(oid)
         if not o or o["status"] != "done":
-            return await q.message.reply_text("برای این سفارش هنوز فاکتور قابل ارسال نیست.")
-        fee = db.order_fees(o)
+            return await q.message.reply_text("برای این سفارش هنوز صورتحساب قابل ارسال نیست.")
+
+        # صورتحساب تجمیعی: تمام سفارش‌های تکمیل‌شده‌ی همین مشتری
+        customer_rows = [
+            row for row in db.customer_orders(o)
+            if row["status"] == "done"
+        ]
+        if not customer_rows:
+            return await q.message.reply_text("برای این مشتری سفارش تکمیل‌شده‌ای جهت صدور صورتحساب وجود ندارد.")
+
+        total_debt = total_paid = 0
+        invoice_lines = []
+        for row in customer_rows:
+            fee = db.order_fees(row)
+            symbol = json.loads(row["data"]).get("symbol", "—")
+            total_debt += fee["commission"]
+            total_paid += fee["paid"]
+            invoice_lines.append(
+                f"• <code>{esc(row['code'])}</code> | {esc(symbol)}\n"
+                f"  معامله: {fee['trade_amount']:,} ریال | "
+                f"کارمزد ({fee['rate']:g}٪): {fee['commission']:,} ریال | "
+                f"پرداختی: {fee['paid']:,} ریال"
+            )
+
+        balance = total_debt - total_paid
+        balance_label = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
         invoice = (
-            f"🧾 <b>فاکتور سفارش</b>\n\n"
-            f"کد رهگیری: <code>{esc(o['code'])}</code>\n"
-            f"نماد: {esc(json.loads(o['data']).get('symbol', '—'))}\n"
-            f"مبلغ معامله: {fee['trade_amount']:,} ریال\n"
-            f"نرخ کارمزد: {fee['rate']:g}٪\n"
-            f"مبلغ کارمزد: <b>{fee['commission']:,} ریال</b>"
+            "🧾 <b>صورتحساب تجمیعی مشتری</b>\n"
+            f"تعداد سفارش‌های تکمیل‌شده: {len(customer_rows)}\n\n"
+            + "\n\n".join(invoice_lines)
+            + "\n\n━━━━━━━━━━━━━━\n"
+            f"جمع کارمزدها: {total_debt:,} ریال\n"
+            f"جمع پرداختی‌ها: {total_paid:,} ریال\n"
+            f"<b>مانده کل حساب: {abs(balance):,} ریال ({balance_label})</b>"
         )
         try:
             await ctx.bot.send_message(o["user_id"], invoice, parse_mode="HTML")
-            await q.message.reply_text("فاکتور با موفقیت برای مشتری ارسال شد.")
+            await q.message.reply_text("صورتحساب کل مشتری با موفقیت ارسال شد.")
         except TelegramError:
-            await q.message.reply_text("ارسال فاکتور ناموفق بود؛ احتمالاً مشتری ربات را مسدود کرده است.")
+            await q.message.reply_text("ارسال صورتحساب ناموفق بود؛ احتمالاً مشتری ربات را مسدود کرده است.")
 
     elif act == "pa":
         ctx.user_data["state"] = ("a_paid", int(p[1]))
