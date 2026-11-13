@@ -631,7 +631,7 @@ async def notify_receipt(ctx, rid, only=None):
         lines.append(f"شماره پیگیری / توضیح: {esc(r['text'][:200])}")
     for dup in db.find_duplicate_receipts(r):
         lines.append(
-            f"🔴 رسید مشابه قبلاً برای سفارش <code>{esc(dup['code'])}</code> ارسال شده "
+            f"🔴 رسید مشابه قبلاً در سیستم ثبت شده است "
             f"(#{dup['id']}، {RECEIPT_LABELS.get(dup['status'], 'در انتظار')})"
         )
     text = "\n".join(lines)
@@ -1135,7 +1135,7 @@ async def admin_cb(q, ctx, p):
             try:
                 await ctx.bot.send_message(
                     r["user_id"],
-                    f"❌ رسید شما برای سفارش {o['code']} پذیرفته نشد. لطفاً رسید صحیح را دوباره ارسال کنید.",
+                    "❌ رسید پرداخت کل حساب شما پذیرفته نشد. لطفاً پس از بررسی، رسید صحیح را از بخش «وضعیت مالی» دوباره ارسال کنید.",
                 )
             except TelegramError:
                 pass
