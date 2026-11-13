@@ -1052,30 +1052,17 @@ async def admin_cb(q, ctx, p):
         if not customer_rows:
             return await q.message.reply_text("برای این مشتری سفارش تکمیل‌شده‌ای جهت صدور صورتحساب وجود ندارد.")
 
-        total_debt = total_paid = 0
-        invoice_lines = []
-        for row in customer_rows:
-            fee = db.order_fees(row)
-            symbol = json.loads(row["data"]).get("symbol", "—")
-            total_debt += fee["commission"]
-            total_paid += fee["paid"]
-            invoice_lines.append(
-                f"• <code>{esc(row['code'])}</code> | {esc(symbol)}\n"
-                f"  معامله: {fee['trade_amount']:,} ریال | "
-                f"کارمزد ({fee['rate']:g}٪): {fee['commission']:,} ریال | "
-                f"پرداختی: {fee['paid']:,} ریال"
-            )
-
+        total_debt = sum(db.order_fees(row)["commission"] for row in customer_rows)
+        total_paid = sum(db.order_fees(row)["paid"] for row in customer_rows)
         balance = total_debt - total_paid
         balance_label = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
         invoice = (
-            "🧾 <b>صورتحساب تجمیعی مشتری</b>\n"
-            f"تعداد سفارش‌های تکمیل‌شده: {len(customer_rows)}\n\n"
-            + "\n\n".join(invoice_lines)
-            + "\n\n━━━━━━━━━━━━━━\n"
-            f"جمع کارمزدها: {total_debt:,} ریال\n"
-            f"جمع پرداختی‌ها: {total_paid:,} ریال\n"
-            f"<b>مانده کل حساب: {abs(balance):,} ریال ({balance_label})</b>"
+            "🧾 <b>صورتحساب کل مشتری</b>\\n"
+            f"تعداد سفارش‌های انجام‌شده: <b>{len(customer_rows)}</b>\\n"
+            f"جمع کل بدهی (کارمزدها): <b>{total_debt:,} ریال</b>\\n"
+            f"جمع پرداختی‌ها: {total_paid:,} ریال\\n"
+            "━━━━━━━━━━━━━━\\n"
+            f"<b>مانده بدهی مشتری: {abs(balance):,} ریال ({balance_label})</b>"
         )
         try:
             await ctx.bot.send_message(o["user_id"], invoice, parse_mode="HTML")
