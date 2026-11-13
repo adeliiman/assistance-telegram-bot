@@ -92,6 +92,15 @@ def init_db():
               decided_by INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_receipts_order ON receipts(order_id);
+            CREATE TABLE IF NOT EXISTS customer_payments(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              receipt_id INTEGER NOT NULL UNIQUE,
+              user_id INTEGER NOT NULL,
+              amount INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              actor_id INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_customer_payments_user ON customer_payments(user_id);
             """
         )
         # مهاجرت ساختار: ستون‌های پرداخت و کارمزد (روی دیتابیس‌ها و بکاپ‌های قدیمی هم کار می‌کند)
@@ -484,7 +493,7 @@ def find_duplicate_receipts(rec, limit=3):
 
 
 def approve_receipt(rid, amount: int, actor_id):
-    """تأیید رسید و ثبت مبلغ در یک تراکنش؛ تأیید دوباره مبلغ را دوبار اضافه نمی‌کند."""
+    """ثبت تأیید و پرداخت در دفتر کل مشتری، نه روی یک سفارش خاص."""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
         cur = c.execute(
@@ -496,13 +505,21 @@ def approve_receipt(rid, amount: int, actor_id):
             return None
         r = c.execute("SELECT * FROM receipts WHERE id=?", (rid,)).fetchone()
         o = c.execute("SELECT * FROM orders WHERE id=?", (r["order_id"],)).fetchone()
-
-        paid = o["paid_amount"] + amount
-        commission = o["commission"] or 0
-        c.execute("UPDATE orders SET paid_amount=?, updated_at=? WHERE id=?", (paid, now(), o["id"]))
-        _log(c, o["id"], actor_id, "receipt_approved", f"#{rid} +{amount} => paid={paid}")
-        return {"order_id": o["id"], "code": o["code"], "user_id": o["user_id"],
-                "paid": paid, "commission": commission, "balance": commission - paid}
+        c.execute(
+            "INSERT INTO customer_payments(receipt_id,user_id,amount,created_at,actor_id) VALUES(?,?,?,?,?)",
+            (rid, r["user_id"], amount, now(), actor_id),
+        )
+        _log(c, o["id"], actor_id, "receipt_approved", f"#{rid} customer payment +{amount}")
+        sums = c.execute(
+            "SELECT COALESCE(SUM(commission),0) debt, COALESCE(SUM(paid_amount),0) legacy_paid"
+            " FROM orders WHERE user_id=? AND status!='error'", (r["user_id"],)
+        ).fetchone()
+        ledger = c.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id=?", (r["user_id"],)
+        ).fetchone()[0]
+        paid = sums["legacy_paid"] + ledger
+        return {"order_id":o["id"],"code":o["code"],"user_id":r["user_id"],
+                "paid":paid,"commission":sums["debt"],"balance":sums["debt"]-paid}
 
 
 def reject_receipt(rid, actor_id):
@@ -546,7 +563,10 @@ def user_finance(user_id) -> dict:
         ).fetchall()
     items = [(r, order_fees(r, rate)) for r in rows]
     debt = sum(f["commission"] for _, f in items)
-    paid = sum(f["paid"] for _, f in items)
+    legacy_paid = sum(f["paid"] for _, f in items)
+    with conn() as c:
+        ledger_paid = c.execute("SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id=?", (user_id,)).fetchone()[0]
+    paid = legacy_paid + ledger_paid
     return {"items": items, "debt": debt, "paid": paid, "balance": debt - paid}
 
 
@@ -554,13 +574,18 @@ def user_finance(user_id) -> dict:
 def customer_summary(order) -> dict:
     """حساب یکجای مشتری: جمع بدهی (کارمزدها)، پرداختی‌ها و مانده؛ سفارش‌های خطادار حساب نمی‌شوند."""
     rate = get_commission_percent()
-    debt = paid = 0
-    for r in customer_orders(order):
-        if r["status"] == "error":
-            continue
-        f = order_fees(r, rate)
-        debt += f["commission"]
-        paid += f["paid"]
+    rows = [r for r in customer_orders(order) if r["status"] != "error"]
+    debt = sum(order_fees(r, rate)["commission"] for r in rows)
+    legacy_paid = sum(order_fees(r, rate)["paid"] for r in rows)
+    ids = sorted({r["user_id"] for r in rows})
+    ledger_paid = 0
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        with conn() as c:
+            ledger_paid = c.execute(
+                f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})", ids
+            ).fetchone()[0]
+    paid = legacy_paid + ledger_paid
     return {"debt": debt, "paid": paid, "balance": debt - paid}
 
 
