@@ -268,14 +268,21 @@ def user_counts(exclude=()):
 
 
 def list_users(limit=8, offset=0, exclude=()):
-    """فهرست کاربران ثبت‌شده، جدیدترین عضویت در ابتدا."""
+    """فهرست مشتری‌ها؛ حساب‌های دارای شماره موبایل مشترک فقط یک‌بار نمایش داده می‌شوند."""
     ex = set(exclude)
     with conn() as c:
         rows = c.execute(
             "SELECT user_id, username, first_seen, blocked FROM users ORDER BY first_seen DESC, user_id DESC"
         ).fetchall()
-    rows = [r for r in rows if r["user_id"] not in ex]
-    return rows[offset:offset + limit], len(rows)
+        visible, seen = [], set()
+        for row in rows:
+            user_id = row["user_id"]
+            if user_id in ex or user_id in seen:
+                continue
+            account_ids = _account_user_ids(c, user_id)
+            seen.update(account_ids)
+            visible.append(row)
+    return visible[offset:offset + limit], len(visible)
 
 
 def get_user(user_id):
