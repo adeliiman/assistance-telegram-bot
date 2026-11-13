@@ -2,6 +2,7 @@ import glob
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -125,6 +126,11 @@ def init_db():
         # هماهنگ‌سازی با وضعیت‌های جدید (روی دیتابیس‌ها و بکاپ‌های قدیمی هم کار می‌کند)
         c.execute("UPDATE orders SET status='new' WHERE status IN ('in_progress')")
         c.execute("UPDATE orders SET status='error' WHERE status='canceled'")
+        for r in c.execute("SELECT key, value FROM settings WHERE key LIKE 'symrate:%'").fetchall():
+            nk = "symrate:" + _norm_sym(r["key"][8:])
+            if nk != r["key"]:
+                c.execute("DELETE FROM settings WHERE key=?", (r["key"],))
+                _set(c, nk, r["value"])
         # مشتری‌های قبلی (که سفارش داده‌اند) برای اطلاعیه‌ی گروهی وارد جدول کاربران می‌شوند
         c.execute(
             "INSERT OR IGNORE INTO users(user_id, username, first_seen) "
@@ -142,15 +148,32 @@ def _log(c, order_id, actor_id, action, detail=""):
         (order_id, actor_id, action, detail, now()),
     )
 
+def _norm_sym(s) -> str:
+    """کلید یکسان برای نماد: ی/ک عربی به فارسی، حذف فاصله و نیم‌فاصله."""
+    s = str(s or "").replace("ي", "ی").replace("ك", "ک")
+    return re.sub(r"[\s\u200c]", "", s)
+
+
+def _rate_for(c, symbol) -> float:
+    """نرخ اختصاصی نماد؛ اگر نبود نرخ پیش‌فرض. ۰ یعنی نرخی ثبت نشده."""
+    v = _get(c, "symrate:" + _norm_sym(symbol), None)
+    if v is None:
+        v = _get(c, "commission_percent", str(config.DEFAULT_COMMISSION_PERCENT))
+    try:
+        return float(v)
+    except ValueError:
+        return 0.0
+
+
 def symbol_rate(symbol):
     with conn() as c:
-        v = _get(c, "symrate:" + symbol.strip(), None)
+        v = _get(c, "symrate:" + _norm_sym(symbol), None)
     return float(v) if v is not None else None
 
 
 def set_symbol_rate(symbol, percent: float):
     with conn() as c:
-        _set(c, "symrate:" + symbol.strip(), percent)
+        _set(c, "symrate:" + _norm_sym(symbol), percent)
 
 
 def list_symbol_rates():
@@ -169,10 +192,7 @@ def complete_order(order_id, amount: int, actor_id):
         if not o:
             return None
         sym = json.loads(o["data"]).get("symbol", "").strip()
-        v = _get(c, "symrate:" + sym, None)
-        rate = float(v) if v is not None else float(
-            _get(c, "commission_percent", str(config.DEFAULT_COMMISSION_PERCENT))
-        )
+        rate = _rate_for(c, sym)
         if rate <= 0:
             return None
         fee = round(amount * rate / 100)
@@ -185,6 +205,7 @@ def complete_order(order_id, amount: int, actor_id):
             "code": o["code"], "user_id": o["user_id"], "symbol": sym,
             "amount": amount, "rate": rate, "fee": fee,
         }
+
 
 # ---------------- settings / capacity ----------------
 def _get(c, key, default):
@@ -401,7 +422,7 @@ def set_status(order_id, status, actor_id):
 
 def set_field(order_id, key, value, actor_id):
     with conn() as c:
-        row = c.execute("SELECT data FROM orders WHERE id=?", (order_id,)).fetchone()
+        row = c.execute("SELECT data, status FROM orders WHERE id=?", (order_id,)).fetchone()
         data = json.loads(row["data"])
         old = data.get(key, "")
         data[key] = value
@@ -410,6 +431,15 @@ def set_field(order_id, key, value, actor_id):
             (json.dumps(data, ensure_ascii=False), now(), order_id),
         )
         _log(c, order_id, actor_id, "edit", f"{key}: {old!r} -> {value!r}")
+        if row["status"] == "done" and key in ("buying_power", "symbol"):
+            amount, rate = _amount_from_data(data), _rate_for(c, data.get("symbol", ""))
+            if amount > 0 and rate > 0:  # کارمزد ذخیره‌شده با مبلغ/نماد جدید هماهنگ شود
+                fee = round(amount * rate / 100)
+                c.execute(
+                    "UPDATE orders SET trade_amount=?, fee_rate=?, commission=? WHERE id=?",
+                    (amount, rate, fee, order_id),
+                )
+                _log(c, order_id, actor_id, "fee_recalc", f"amount={amount} rate={rate} fee={fee}")
 
 
 # ---------------- payment & commission ----------------
@@ -426,7 +456,10 @@ def order_total(o) -> int:
     اگر تعداد و قیمت موجود باشند، ارزش معامله از حاصل‌ضرب آن‌ها محاسبه می‌شود؛
     در نسخه‌هایی که فیلد قیمت ندارند، قدرت خرید ثبت‌شده مبنا قرار می‌گیرد.
     """
-    d = json.loads(o["data"])
+    return _amount_from_data(json.loads(o["data"]))
+
+
+def _amount_from_data(d: dict) -> int:
     quantity = _to_int(d.get("quantity"))
     price = _to_int(d.get("price"))
     if quantity > 0 and price > 0:
