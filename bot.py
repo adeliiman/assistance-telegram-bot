@@ -962,6 +962,7 @@ async def admin_cb(q, ctx, p):
         status = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
         pending = db.count_pending_receipts(user_id=user_id)
         receipts = db.list_user_receipts(user_id, 5)
+        account_payments = db.list_account_payments(user_id, 5)
         lines = [
             "👤 <b>پرونده مالی مشتری</b>",
             f"نام: {esc(name)}",
@@ -977,13 +978,19 @@ async def admin_cb(q, ctx, p):
             f"مانده: <b>{abs(balance):,} ریال ({status})</b>",
             f"رسید در انتظار بررسی: {pending}",
         ]
-        if receipts:
+        if receipts or account_payments:
             lines += ["", "<b>آخرین پرداخت‌ها و رسیدها</b>"]
             for receipt in receipts:
-                amount = f" | {receipt['amount']:,} ریال" if receipt["amount"] is not None else ""
+                if receipt["status"] != "approved":
+                    lines.append(
+                        f"رسید #{receipt['id']} | {fmt_time(receipt['created_at'])} | "
+                        f"{RECEIPT_LABELS.get(receipt['status'], receipt['status'])}"
+                    )
+            for payment in account_payments:
+                source = "پرداخت دستی مدیر" if payment["source"] == "manual" else "پرداخت تأییدشده"
                 lines.append(
-                    f"#{receipt['id']} | {fmt_time(receipt['created_at'])} | "
-                    f"{RECEIPT_LABELS.get(receipt['status'], receipt['status'])}{amount}"
+                    f"{source} #{payment['id']} | {fmt_time(payment['created_at'])} | "
+                    f"{payment['amount']:,} ریال"
                 )
         kb = []
         if pending:
