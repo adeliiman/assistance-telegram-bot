@@ -975,7 +975,7 @@ async def admin_cb(q, ctx, p):
             if done and can(uid, "pay"):
                 kb.append([B("📨 ارسال صورتحساب کل", callback_data=f"a:inv:{done['id']}")])
         kb.append([B("⬅️ فهرست کاربران", callback_data="a:users:0")])
-        await show(q, "\\n".join(lines), M(kb))
+        await show(q, "\n".join(lines), M(kb))
 
     elif act == "uhist":
         user_id = int(p[1])
@@ -985,7 +985,7 @@ async def admin_cb(q, ctx, p):
         account_ids = db.account_user_ids(user_id)
         orders = []
         for account_id in account_ids:
-            found, _ = db.list_orders(None, 500, 0, user_id=account_id)
+            found, _ = db.list_user_orders(account_id, 500, 0)
             orders.extend(found)
         orders.sort(key=lambda r: r["id"], reverse=True)
         kb = [order_button(row) for row in orders[:30]]
