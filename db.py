@@ -101,6 +101,15 @@ def init_db():
               actor_id INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_customer_payments_user ON customer_payments(user_id);
+            CREATE TABLE IF NOT EXISTS manual_customer_payments(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              amount INTEGER NOT NULL,
+              note TEXT,
+              created_at TEXT NOT NULL,
+              actor_id INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_manual_customer_payments_user ON manual_customer_payments(user_id);
             """
         )
         # مهاجرت ساختار: ستون‌های پرداخت و کارمزد (روی دیتابیس‌ها و بکاپ‌های قدیمی هم کار می‌کند)
@@ -480,6 +489,27 @@ def _account_user_ids(c, user_id):
     return sorted({row["user_id"] for row in rows} | {user_id})
 
 
+def add_manual_customer_payment(user_id, amount: int, actor_id, note=""):
+    """ثبت پرداخت دستی در دفتر کل کل حساب مشتری."""
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
+        cur = c.execute(
+            "INSERT INTO manual_customer_payments(user_id,amount,note,created_at,actor_id) VALUES(?,?,?,?,?)",
+            (user_id, amount, note, now(), actor_id),
+        )
+        order = c.execute(
+            f"SELECT id FROM orders WHERE user_id IN ({marks}) ORDER BY id DESC LIMIT 1",
+            account_ids,
+        ).fetchone()
+        if order:
+            _log(c, order["id"], actor_id, "manual_customer_payment", f"+{amount} ریال")
+        return cur.lastrowid
+
+
 def add_receipt(order_id, user_id, kind, file_id=None, file_uid=None, text=None) -> int:
     """ثبت یک رسید برای کل حساب؛ هم‌زمان بیش از یک رسید معلق برای مشتری مجاز نیست."""
     with conn() as c:
@@ -634,6 +664,10 @@ def user_finance(user_id) -> dict:
             f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})",
             account_ids,
         ).fetchone()[0]
+        ledger_paid += c.execute(
+            f"SELECT COALESCE(SUM(amount),0) FROM manual_customer_payments WHERE user_id IN ({marks})",
+            account_ids,
+        ).fetchone()[0]
     items = [(r, order_fees(r, rate)) for r in rows]
     debt = sum(f["commission"] for _, f in items)
     legacy_paid = sum(f["paid"] for _, f in items)
@@ -655,6 +689,9 @@ def customer_summary(order) -> dict:
         with conn() as c:
             ledger_paid = c.execute(
                 f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})", ids
+            ).fetchone()[0]
+            ledger_paid += c.execute(
+                f"SELECT COALESCE(SUM(amount),0) FROM manual_customer_payments WHERE user_id IN ({marks})", ids
             ).fetchone()[0]
     paid = legacy_paid + ledger_paid
     return {"debt": debt, "paid": paid, "balance": debt - paid}
