@@ -469,6 +469,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ======================= admin side =======================
 ADMIN_ITEMS = [
     ("view", "📋 سفارش‌ها", "a:l:top:0"),
+    ("view", "👥 کاربران و حساب‌ها", "a:users:0"),
     ("view", "🔍 جستجو", "a:search"),
     ("export", "📊 خروجی اکسل", "a:x"),
     ("faq", "❓ مدیریت سوالات", "a:faq"),
@@ -705,6 +706,7 @@ async def finish_approval(msg, ctx, rid, amount, uid):
 
 ACT_PERM = {
     "home": "view", "l": "view", "o": "view", "search": "view", "hist": "view",
+    "users": "view", "usr": "view", "uhist": "view",
     "s": "status", "e": "edit", "ef": "edit", "n": "note",
     "pay": "pay", "pa": "pay", "inv": "pay",
     "rca": "pay", "rcf": "pay", "rcm": "pay", "rcr": "pay", "rcl": "pay",
@@ -899,6 +901,96 @@ async def admin_cb(q, ctx, p):
             title = "همه" if status == "all" else config.STATUSES[status]
             head = f"📋 سفارش‌ها — {title} ({total})"
         await show(q, head, M(kb))
+
+    elif act == "users":
+        page = max(0, int(p[1]) if len(p) > 1 else 0)
+        rows, total = db.list_users(PAGE, page * PAGE, exclude=all_staff())
+        kb = []
+        for user in rows:
+            finance = db.user_finance(user["user_id"])
+            bal = finance["balance"]
+            label = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
+            username = f"@{user['username']}" if user["username"] else f"ID {user['user_id']}"
+            pending = db.count_pending_receipts(user_id=user["user_id"])
+            receipt_mark = " 🧾" if pending else ""
+            kb.append([B(
+                f"{username} | {abs(bal):,} ریال ({label}){receipt_mark}",
+                callback_data=f"a:usr:{user['user_id']}",
+            )])
+        nav = []
+        if page > 0:
+            nav.append(B("◀️ قبلی", callback_data=f"a:users:{page - 1}"))
+        if (page + 1) * PAGE < total:
+            nav.append(B("بعدی ▶️", callback_data=f"a:users:{page + 1}"))
+        if nav:
+            kb.append(nav)
+        kb.append([B("🏠 پنل مدیریت", callback_data="a:home")])
+        await show(q, f"👥 <b>کاربران و وضعیت حساب‌ها</b>\nتعداد کل: {total}\nصفحه {page + 1}", M(kb))
+
+    elif act == "usr":
+        user_id = int(p[1])
+        user = db.get_user(user_id)
+        if not user:
+            return await q.message.reply_text("کاربر پیدا نشد.")
+        finance = db.user_finance(user_id)
+        rows = [r for r, _ in finance["items"]]
+        orders = db.customer_orders(rows[0]) if rows else []
+        if not rows:
+            # کاربری که هنوز سفارش ندارد
+            orders = []
+        profile = json.loads(orders[0]["data"]) if orders else {}
+        name = profile.get("full_name") or "—"
+        phone = profile.get("phone") or "—"
+        balance = finance["balance"]
+        status = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
+        pending = db.count_pending_receipts(user_id=user_id)
+        receipts = db.list_user_receipts(user_id, 5)
+        lines = [
+            "👤 <b>پرونده مالی مشتری</b>",
+            f"نام: {esc(name)}",
+            f"موبایل: {esc(phone)}",
+            f"شناسه تلگرام: <code>{user_id}</code>",
+            f"نام کاربری: @{esc(user['username'] or '—')}",
+            "",
+            f"تعداد سفارش‌ها: {len(orders)}",
+            f"جمع بدهی: <b>{finance['debt']:,} ریال</b>",
+            f"جمع پرداختی: <b>{finance['paid']:,} ریال</b>",
+            f"مانده: <b>{abs(balance):,} ریال ({status})</b>",
+            f"رسید در انتظار بررسی: {pending}",
+        ]
+        if receipts:
+            lines += ["", "<b>آخرین پرداخت‌ها و رسیدها</b>"]
+            for receipt in receipts:
+                amount = f" | {receipt['amount']:,} ریال" if receipt["amount"] is not None else ""
+                lines.append(
+                    f"#{receipt['id']} | {fmt_time(receipt['created_at'])} | "
+                    f"{RECEIPT_LABELS.get(receipt['status'], receipt['status'])}{amount}"
+                )
+        kb = []
+        if pending:
+            kb.append([B("🧾 بررسی رسیدهای پرداخت", callback_data=f"a:rcl:{user_id}")])
+        if orders:
+            kb.append([B("📋 مشاهده سفارش‌های مشتری", callback_data=f"a:uhist:{user_id}")])
+            done = next((r for r in orders if r["status"] == "done"), None)
+            if done and can(uid, "pay"):
+                kb.append([B("📨 ارسال صورتحساب کل", callback_data=f"a:inv:{done['id']}")])
+        kb.append([B("⬅️ فهرست کاربران", callback_data="a:users:0")])
+        await show(q, "\\n".join(lines), M(kb))
+
+    elif act == "uhist":
+        user_id = int(p[1])
+        user = db.get_user(user_id)
+        if not user:
+            return await q.message.reply_text("کاربر پیدا نشد.")
+        account_ids = db.account_user_ids(user_id)
+        orders = []
+        for account_id in account_ids:
+            found, _ = db.list_orders(None, 500, 0, user_id=account_id)
+            orders.extend(found)
+        orders.sort(key=lambda r: r["id"], reverse=True)
+        kb = [order_button(row) for row in orders[:30]]
+        kb.append([B("⬅️ پرونده مالی", callback_data=f"a:usr:{user_id}")])
+        await show(q, f"📋 سفارش‌های مشتری ({len(orders)})", M(kb))
 
     elif act == "o":
         o = db.get_order(int(p[1]))
