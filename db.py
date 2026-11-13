@@ -267,6 +267,22 @@ def user_counts(exclude=()):
     return len(rows), sum(1 for r in rows if not r[1])
 
 
+def list_users(limit=8, offset=0, exclude=()):
+    """فهرست کاربران ثبت‌شده، جدیدترین عضویت در ابتدا."""
+    ex = set(exclude)
+    with conn() as c:
+        rows = c.execute(
+            "SELECT user_id, username, first_seen, blocked FROM users ORDER BY first_seen DESC, user_id DESC"
+        ).fetchall()
+    rows = [r for r in rows if r["user_id"] not in ex]
+    return rows[offset:offset + limit], len(rows)
+
+
+def get_user(user_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+
 # ---------------- orders ----------------
 def create_order(user_id, username, data: dict):
     """برمی‌گرداند (order_id, code) یا (None, reason) اگر پذیرش بسته/پر باشد.
@@ -436,6 +452,12 @@ def set_paid_amount(order_id, amount: int, actor_id):
 
 
 # ---------------- payment receipts ----------------
+def account_user_ids(user_id):
+    """شناسه‌های تلگرام متعلق به یک مشتری؛ تطبیق بر اساس آیدی یا شماره موبایل."""
+    with conn() as c:
+        return _account_user_ids(c, user_id)
+
+
 def _account_user_ids(c, user_id):
     """شناسه‌های تلگرام متعلق به یک مشتری؛ تطبیق بر اساس آیدی یا شماره موبایل."""
     anchor = c.execute(
