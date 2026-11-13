@@ -436,13 +436,30 @@ def set_paid_amount(order_id, amount: int, actor_id):
 
 
 # ---------------- payment receipts ----------------
+def _account_user_ids(c, user_id):
+    """شناسه‌های تلگرام متعلق به یک مشتری؛ تطبیق بر اساس آیدی یا شماره موبایل."""
+    anchor = c.execute(
+        "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)
+    ).fetchone()
+    if not anchor:
+        return [user_id]
+    phone = json.loads(anchor["data"]).get("phone", "")
+    rows = c.execute(
+        "SELECT DISTINCT user_id FROM orders WHERE user_id=? OR (?!='' AND data LIKE ?)",
+        (user_id, phone, f'%"phone": "{phone}"%'),
+    ).fetchall()
+    return sorted({row["user_id"] for row in rows} | {user_id})
+
+
 def add_receipt(order_id, user_id, kind, file_id=None, file_uid=None, text=None) -> int:
     """ثبت یک رسید برای کل حساب؛ هم‌زمان بیش از یک رسید معلق برای مشتری مجاز نیست."""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
         pending = c.execute(
-            "SELECT 1 FROM receipts WHERE user_id=? AND status='pending' LIMIT 1",
-            (user_id,),
+            f"SELECT 1 FROM receipts WHERE user_id IN ({marks}) AND status='pending' LIMIT 1",
+            account_ids,
         ).fetchone()
         if pending:
             raise ValueError("customer already has a pending receipt")
@@ -463,8 +480,11 @@ def get_receipt(rid):
 def count_pending_receipts(user_id=None, order_id=None) -> int:
     q, args = "SELECT COUNT(*) FROM receipts WHERE status='pending'", []
     if user_id is not None:
-        q += " AND user_id=?"
-        args.append(user_id)
+        with conn() as c:
+            account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
+        q += f" AND user_id IN ({marks})"
+        args.extend(account_ids)
     if order_id is not None:
         q += " AND order_id=?"
         args.append(order_id)
@@ -475,8 +495,11 @@ def count_pending_receipts(user_id=None, order_id=None) -> int:
 def list_pending_receipts(user_id):
     """رسیدهای در انتظار بررسی برای کل حساب مشتری."""
     with conn() as c:
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
         return c.execute(
-            "SELECT * FROM receipts WHERE user_id=? AND status='pending' ORDER BY id", (user_id,)
+            f"SELECT * FROM receipts WHERE user_id IN ({marks}) AND status='pending' ORDER BY id",
+            account_ids,
         ).fetchall()
 
 
@@ -519,12 +542,15 @@ def approve_receipt(rid, amount: int, actor_id):
             (rid, r["user_id"], amount, now(), actor_id),
         )
         _log(c, o["id"], actor_id, "receipt_approved", f"#{rid} customer payment +{amount}")
+        account_ids = _account_user_ids(c, r["user_id"])
+        marks = ",".join("?" for _ in account_ids)
         sums = c.execute(
-            "SELECT COALESCE(SUM(commission),0) debt, COALESCE(SUM(paid_amount),0) legacy_paid"
-            " FROM orders WHERE user_id=? AND status!='error'", (r["user_id"],)
+            f"SELECT COALESCE(SUM(commission),0) debt, COALESCE(SUM(paid_amount),0) legacy_paid"
+            f" FROM orders WHERE user_id IN ({marks}) AND status!='error'", account_ids
         ).fetchone()
         ledger = c.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id=?", (r["user_id"],)
+            f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})",
+            account_ids,
         ).fetchone()[0]
         paid = sums["legacy_paid"] + ledger
         return {"order_id":o["id"],"code":o["code"],"user_id":r["user_id"],
@@ -549,10 +575,12 @@ def reject_receipt(rid, actor_id):
 def list_user_receipts(user_id, limit=10):
     """رسیدهای یک مشتری (جدیدترین اول) همراه کد سفارش."""
     with conn() as c:
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
         return c.execute(
             "SELECT r.*, o.code AS code FROM receipts r JOIN orders o ON o.id=r.order_id"
-            " WHERE r.user_id=? ORDER BY r.id DESC LIMIT ?",
-            (user_id, limit),
+            f" WHERE r.user_id IN ({marks}) ORDER BY r.id DESC LIMIT ?",
+            account_ids + [limit],
         ).fetchall()
 
 
@@ -567,14 +595,19 @@ def user_finance(user_id) -> dict:
     """حساب مالی خودِ مشتری (فقط با همین آیدی تلگرام؛ سفارش‌های خطادار حساب نمی‌شوند)."""
     rate = get_commission_percent()
     with conn() as c:
+        account_ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in account_ids)
         rows = c.execute(
-            "SELECT * FROM orders WHERE user_id=? AND status!='error' ORDER BY id DESC", (user_id,)
+            f"SELECT * FROM orders WHERE user_id IN ({marks}) AND status!='error' ORDER BY id DESC",
+            account_ids,
         ).fetchall()
+        ledger_paid = c.execute(
+            f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})",
+            account_ids,
+        ).fetchone()[0]
     items = [(r, order_fees(r, rate)) for r in rows]
     debt = sum(f["commission"] for _, f in items)
     legacy_paid = sum(f["paid"] for _, f in items)
-    with conn() as c:
-        ledger_paid = c.execute("SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id=?", (user_id,)).fetchone()[0]
     paid = legacy_paid + ledger_paid
     return {"items": items, "debt": debt, "paid": paid, "balance": debt - paid}
 
