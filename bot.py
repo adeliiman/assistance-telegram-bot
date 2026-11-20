@@ -83,6 +83,26 @@ def fmt_time(iso: str) -> str:
     return datetime.fromisoformat(iso).astimezone(TZ).strftime("%Y-%m-%d %H:%M")
 
 
+def fmt_num(v) -> str:
+    """عدد با جداکننده‌ی سه‌رقمی: 100000000 ← 100,000,000"""
+    try:
+        return f"{int(str(v).replace(',', '').strip()):,}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def money(n) -> str:
+    """مبلغ به تومان با جداکننده‌ی سه‌رقمی: 2000000 ← 2,000,000 تومان"""
+    return f"{int(n):,} تومان"
+
+
+FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def fa_num(n) -> str:
+    return str(n).translate(FA_DIGITS)
+
+
 def get_field(key):
     return next(f for f in config.FORM_FIELDS if f["key"] == key)
 
@@ -130,6 +150,8 @@ def field_text(f, v, reveal=False):
         return "—"
     if f["kind"] == "secret" and not reveal:
         return SECRET_MASK
+    if f["kind"] == "int":
+        return fmt_num(v)
     return v
 
 
@@ -150,9 +172,9 @@ def render_order(o, admin=False, reveal=False):
             bal = db.customer_summary(o)["balance"]
             lbl = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
             lines += ["",
-                      f"🧾 کارمزد این سفارش: {fee['commission']:,} ریال "
+                      f"🧾 کارمزد این سفارش: {fee['commission']:,} تومان "
                       f"({fee['rate']:g}٪ از {fee['trade_amount']:,})",
-                      f"💰 حساب کل مشتری: {abs(bal):,} ریال ({lbl})"]
+                      f"💰 حساب کل مشتری: {abs(bal):,} تومان ({lbl})"]
         lines += ["", f"👤 تلگرام: {esc(uname)} | id: <code>{o['user_id']}</code>"]
         n_cust = len(db.customer_orders(o))
         if n_cust > 1:
@@ -246,33 +268,96 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("لغو شد.", reply_markup=main_kb(update.effective_user.id))
 
 
+DEFAULT_PREFIX = "↩️ همان قبلی:"
+
+
+def default_for(ctx, f):
+    """مقدار قبلی/ذخیره‌شده‌ی یک فیلد برای پیشنهاد (رمز هرگز پیشنهاد نمی‌شود)."""
+    if f["kind"] == "secret":
+        return None
+    ud = ctx.user_data
+    return (ud.get("form") or {}).get(f["key"]) or (ud.get("defaults") or {}).get(f["key"]) or None
+
+
+def use_default(ctx, f, raw):
+    if raw.startswith(DEFAULT_PREFIX):
+        return default_for(ctx, f) or raw
+    return raw
+
+
+def next_idx(ctx, i):
+    skip = ctx.user_data.get("skip") or set()
+    while i < len(config.FORM_FIELDS) and config.FORM_FIELDS[i]["key"] in skip:
+        i += 1
+    return i
+
+
 async def ask_field(msg, ctx):
     f = config.FORM_FIELDS[ctx.user_data["idx"]]
     text = f["label"]
     if not f.get("required", True):
         text += "\n(اختیاری؛ برای رد شدن «-» بفرستید)"
-    rows = [list(f["choices"])] if f["kind"] == "choice" else []
+    rows = []
+    default = default_for(ctx, f)
+    if default:
+        shown = field_text(f, default)
+        text += f"\nمقدار قبلی: {shown}"
+        if f["kind"] != "choice":
+            rows.append([f"{DEFAULT_PREFIX} {shown[:40]}"])
+    if f["kind"] == "choice":
+        rows.append(list(f["choices"]))
     rows.append([BTN_CANCEL])
     await msg.reply_text(text, reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True))
 
 
-async def start_form(msg, ctx, uid):
+def order_block_msg(uid):
+    """اگر ثبت سفارش ممکن نیست، متن دلیل؛ وگرنه None."""
     if is_admin(uid):
-        await msg.reply_text("مدیرها نیازی به ثبت سفارش ندارند.", reply_markup=main_kb(uid))
-        return
+        return "مدیرها نیازی به ثبت سفارش ندارند."
     reason = db.intake_state()["reason"]
     if reason:
-        await msg.reply_text(CLOSED_MSG[reason], reply_markup=main_kb(uid))
-        return
+        return CLOSED_MSG[reason]
     if db.count_orders_today(uid) >= config.MAX_ORDERS_PER_DAY:
-        await msg.reply_text("تعداد سفارش‌های امروز شما به سقف مجاز رسیده است.")
+        return "تعداد سفارش‌های امروز شما به سقف مجاز رسیده است."
+    return None
+
+
+async def begin_form(msg, ctx, form=None, skip=(), defaults=None):
+    """شروع فرم؛ form مقادیر از پیش‌پرشده، skip کلیدهایی که دوباره پرسیده نمی‌شوند، defaults مقادیر پیشنهادی."""
+    ctx.user_data.clear()
+    ctx.user_data.update(
+        state=("form",), idx=0, form=dict(form or {}), skip=set(skip), defaults=dict(defaults or {})
+    )
+    await msg.reply_text("⚠️. پیام حاوی «کلمه عبور» بعد از دریافت از چت پاک می‌شود.")
+    i = next_idx(ctx, 0)
+    if i >= len(config.FORM_FIELDS):
+        return await send_confirm(msg, ctx)
+    ctx.user_data["idx"] = i
+    await ask_field(msg, ctx)
+
+
+async def start_form(msg, ctx, uid):
+    blocked = order_block_msg(uid)
+    if blocked:
+        await msg.reply_text(blocked, reply_markup=main_kb(uid))
         return
     ctx.user_data.clear()
-    ctx.user_data.update(state=("form",), idx=0, form={})
-    await msg.reply_text(
-        "⚠️. پیام حاوی «کلمه عبور» بعد از دریافت از چت پاک می‌شود."
+    profile = db.get_profile(uid)
+    if not profile:
+        return await begin_form(msg, ctx)
+    lines = ["📌 <b>اطلاعات ذخیره‌شده‌ی شما</b>", ""]
+    for f in config.FORM_FIELDS:
+        if f.get("remember") and profile.get(f["key"]):
+            lines.append(f"{esc(f['label'])}: {esc(field_text(f, profile[f['key']]))}")
+    lines += ["", "می‌توانید با همین اطلاعات سفارش بدهید، آن‌ها را ویرایش کنید یا فرم را خالی پر کنید."]
+    kb = M(
+        [
+            [B("✅ استفاده از اطلاعات ذخیره‌شده", callback_data="pf:use")],
+            [B("✏️ ویرایش اطلاعات ذخیره‌شده", callback_data="pf:edit")],
+            [B("🆕 ورود اطلاعات جدید", callback_data="pf:new"), B("🗑 حذف اطلاعات", callback_data="pf:del")],
+        ]
     )
-    await ask_field(msg, ctx)
+    await msg.reply_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
 def confirm_kb():
@@ -303,6 +388,7 @@ async def _wipe(msg):
 async def form_step(update, ctx, raw):
     i = ctx.user_data["idx"]
     f = config.FORM_FIELDS[i]
+    raw = use_default(ctx, f, raw)
     val, err = validate(f, raw)
     if f["kind"] == "secret":
         await _wipe(update.message)
@@ -310,7 +396,7 @@ async def form_step(update, ctx, raw):
         await update.message.reply_text(err)
         return
     ctx.user_data["form"][f["key"]] = val
-    i += 1
+    i = next_idx(ctx, i + 1)
     if i < len(config.FORM_FIELDS):
         ctx.user_data["idx"] = i
         await ask_field(update.message, ctx)
@@ -345,43 +431,46 @@ def my_orders_view(uid, page):
     return "\n".join(lines), M(kb)
 
 
-def fin_view(uid):
-    """وضعیت مالی مشتری: جمع بدهی/پرداخت/مانده، فهرست سفارش‌ها و پیگیری رسیدها."""
-    s = db.user_finance(uid)
-    recs = db.list_user_receipts(uid, 10)
-    if not s["items"] and not recs:
-        return "هنوز سفارش یا رسیدی ثبت نشده است.", None
-    bal = s["balance"]
-    lbl = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
-    lines = [
-        "💰 <b>وضعیت مالی شما</b>",
-        "",
-        f"جمع بدهی (کارمزدها): {s['debt']:,} ریال",
-        f"جمع دریافتی‌ها: {s['paid']:,} ریال",
-        f"مانده حساب: {abs(bal):,} ریال ({lbl})",
-    ]
-    kb = []
-    if s["items"]:
-        lines += ["", "<b>سفارش‌ها</b>"]
-        for r, f in s["items"][:15]:
-            sym = json.loads(r["data"]).get("symbol", "")
-            fee_txt = f"{f['commission']:,} ریال" if r["status"] == "done" else "هنوز مشخص نشده"
-            lines.append(
-                f"🔖 <code>{esc(r['code'])}</code> | {esc(sym)}\n"
-                f"   کارمزد: {fee_txt}"
-            )
-    pending = db.count_pending_receipts(user_id=uid)
-    if bal > 0 and pending == 0:
-        kb.append([B(f"🧾 ارسال رسید پرداخت کل بدهی ({bal:,} ریال)", callback_data="rc:all")])
-    if recs:
-        lines += ["", "<b>پیگیری پرداخت کل حساب</b>"]
-        for r in recs:
-            amt = f" | {r['amount']:,} ریال" if r["status"] == "approved" else ""
-            lines.append(f"#{r['id']} | {fmt_time(r['created_at'])} | {RECEIPT_CUSTOMER[r['status']]}{amt}")
-    if pending:
-        lines += ["", "⏳ یک رسید شما در انتظار بررسی است؛ پس از اعلام نتیجه می‌توانید رسید دیگری ارسال کنید."]
-    kb.append([B("🔄 به‌روزرسانی", callback_data="fin")])
-    return "\n".join(lines), M(kb)
+async def send_fin(msg, uid):
+    """وضعیت مالی مشتری: فقط صورتحساب‌های پرداخت‌نشده‌ای که مدیر فرستاده؛ زیر هر کدام دکمه‌ی ارسال رسید."""
+    invs = db.list_unpaid_invoices(uid)
+    if not invs:
+        await msg.reply_text("✅ شما بدهی یا صورتحساب پرداخت‌نشده‌ای ندارید.", reply_markup=main_kb(uid))
+        return
+    total = sum(i["amount"] - i["paid_amount"] for i in invs)
+    await msg.reply_text(
+        "💰 <b>وضعیت مالی شما</b>\n"
+        f"صورتحساب‌های پرداخت‌نشده: {len(invs)}\n"
+        f"جمع مبلغ قابل پرداخت: {money(total)}",
+        parse_mode="HTML",
+        reply_markup=main_kb(uid),
+    )
+    for inv in invs[:10]:
+        rem = inv["amount"] - inv["paid_amount"]
+        lines = [f"🧾 <b>صورتحساب #{inv['id']}</b> | {fmt_time(inv['created_at'])}", "", esc(inv["text"]), "",
+                 f"مبلغ قابل پرداخت: {money(rem)}"]
+        if inv["paid_amount"]:
+            lines.append(f"پرداخت‌شده تا اینجا: {money(inv['paid_amount'])}")
+        last = db.last_invoice_receipt(inv["id"])
+        kb = None
+        if last and last["status"] == "pending":
+            lines += ["", "⏳ رسید شما در انتظار بررسی مدیر است."]
+        else:
+            if last and last["status"] == "rejected":
+                lines += ["", "❌ آخرین رسید شما رد شد؛ لطفاً رسید صحیح را ارسال کنید."]
+            kb = M([[B("🧾 ارسال رسید پرداخت", callback_data=f"rc:{inv['id']}")]])
+        await msg.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    if len(invs) > 10:
+        await msg.reply_text(f"… و {len(invs) - 10} صورتحساب دیگر. پس از تسویه‌ی موارد بالا نمایش داده می‌شوند.")
+
+
+def rates_lines():
+    """فهرست نرخ نمادها؛ همین فهرست هم به مشتری و هم به مدیر نشان داده می‌شود."""
+    lines = [f"• {sym}: {rate:g}٪" for sym, rate in db.list_symbol_rates()]
+    default = db.get_commission_percent()
+    if lines and default > 0:
+        lines += ["", f"سایر نمادها: {default:g}٪"]
+    return lines
 
 
 async def menu_text(update, ctx, raw):
@@ -401,12 +490,11 @@ async def menu_text(update, ctx, raw):
         text, kb = my_orders_view(uid, 0)
         await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
     elif raw == BTN_FIN:
-        text, kb = fin_view(uid)
-        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+        await send_fin(update.message, uid)
     elif raw == BTN_RATES:
-        t = db.get_rates_text()
+        lines = rates_lines()
         await update.message.reply_text(
-            "💹 نرخ کارمزد سهام‌ها\n\n" + t if t else "نرخ‌ها هنوز اعلام نشده است؛ لطفاً کانال را ببینید.",
+            "💹 نرخ کارمزد سهام‌ها\n\n" + "\n".join(lines) if lines else "نرخ‌ها هنوز اعلام نشده است؛ لطفاً کانال را ببینید.",
             reply_markup=main_kb(uid),
         )
     elif raw == BTN_FAQ:
@@ -438,6 +526,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await form_step(update, ctx, raw)
     if kind == "form_edit":
         f = config.FORM_FIELDS[st[1]]
+        raw = use_default(ctx, f, raw)
         val, err = validate(f, raw)
         if f["kind"] == "secret":
             await _wipe(update.message)
@@ -553,10 +642,55 @@ def pay_kb(o):
     oid = o["id"]
     rows = []
     if o["status"] == "done":
-        rows.append([B("🧾 ارسال صورتحساب کل مشتری", callback_data=f"a:inv:{oid}")])
+        rows.append([B("🧾 صدور صورتحساب مشتری", callback_data=f"a:inv:{oid}")])
     rows.append([B("💰 ثبت مبلغ دریافتی", callback_data=f"a:pa:{oid}")])
     rows.append([B("⬅️ سفارش", callback_data=f"a:o:{oid}")])
     return M(rows)
+
+
+def invoice_default_text(name, count, amount):
+    return config.INVOICE_TEMPLATE.format(
+        name=name or "مشتری گرامی", count=fa_num(count), amount=f"{amount:,}"
+    )
+
+
+def invoice_preview(inv):
+    """پیش‌نمایش صورتحساب برای مالک (متن ساده؛ همان‌طور که به مشتری می‌رسد)."""
+    text = (
+        "🧾 پیش‌نمایش صورتحساب — به همین صورت برای مشتری ارسال می‌شود:\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{inv['text']}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"مبلغ قابل پرداخت (ثبت در سیستم): {money(inv['amount'])}"
+    )
+    if inv["amount"] < inv["default"]:
+        text += f"\nتخفیف نسبت به مبلغ پیشنهادی: {money(inv['default'] - inv['amount'])}"
+    kb = M(
+        [
+            [B("✅ تأیید و ارسال برای مشتری", callback_data="a:invy")],
+            [B("✏️ ویرایش متن", callback_data="a:invt"), B("💲 تغییر مبلغ / تخفیف", callback_data="a:inva")],
+            [B("❌ انصراف", callback_data="a:invc")],
+        ]
+    )
+    return text, kb
+
+
+async def start_invoice(msg, ctx, user_id):
+    d = db.invoice_draft(user_id)
+    if not d["count"] or d["amount"] <= 0:
+        return await msg.reply_text(
+            "چیزی برای صدور صورتحساب نیست: این مشتری سفارش انجام‌شده‌ی بدون صورتحساب و با بدهی باز ندارد."
+        )
+    name = db.account_last_data(user_id).get("full_name")
+    inv = {
+        "user_id": user_id, "count": d["count"], "default": d["amount"], "amount": d["amount"],
+        "name": name, "edited": False,
+        "text": invoice_default_text(name, d["count"], d["amount"]),
+    }
+    ctx.user_data.pop("state", None)
+    ctx.user_data["inv"] = inv
+    text, kb = invoice_preview(inv)
+    await msg.reply_text(text, reply_markup=kb)
 
 
 async def notify_admins(ctx, o):
@@ -625,10 +759,16 @@ async def notify_receipt(ctx, rid, only=None):
     d = json.loads(o["data"])
     summary = db.user_finance(r["user_id"])
     lines = [
-        f"🧾 <b>رسید پرداخت کل حساب #{rid}</b>",
+        f"🧾 <b>رسید پرداخت #{rid}</b>",
         f"مشتری: {esc(d.get('full_name') or '—')} | {esc(d.get('phone') or '—')}",
-        f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} ریال",
+        f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} تومان",
     ]
+    inv = db.get_invoice(r["invoice_id"]) if r["invoice_id"] else None
+    if inv:
+        lines.append(
+            f"🧾 صورتحساب #{inv['id']} | مبلغ: {money(inv['amount'])} | "
+            f"مانده‌ی صورتحساب: {money(inv['amount'] - inv['paid_amount'])}"
+        )
     if r["text"]:
         lines.append(f"شماره پیگیری / توضیح: {esc(r['text'][:200])}")
     for dup in db.find_duplicate_receipts(r):
@@ -655,30 +795,25 @@ async def notify_receipt(ctx, rid, only=None):
 async def submit_receipt(update, ctx, kind, file_id=None, file_uid=None, text=None):
     uid = update.effective_user.id
     st = ctx.user_data.get("state")
-    if not st or st[0] != "receipt" or st[1] != uid:
+    if not st or st[0] != "receipt" or st[1] != uid or len(st) < 3:
         ctx.user_data.clear()
-        return await update.message.reply_text("درخواست ارسال رسید معتبر نیست؛ از وضعیت مالی اقدام کنید.", reply_markup=main_kb(uid))
-    summary = db.user_finance(uid)
-    if summary["balance"] <= 0:
-        ctx.user_data.clear()
-        return await update.message.reply_text("در حال حاضر بدهی پرداخت‌نشده‌ای ندارید.", reply_markup=main_kb(uid))
-    if db.count_pending_receipts(user_id=uid):
-        ctx.user_data.clear()
-        return await update.message.reply_text("یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.", reply_markup=main_kb(uid))
-    completed = [r for r, _ in summary["items"] if r["status"] == "done"]
-    if not completed:
-        ctx.user_data.clear()
-        return await update.message.reply_text("سفارش تکمیل‌شده‌ای برای ثبت پرداخت وجود ندارد.", reply_markup=main_kb(uid))
+        return await update.message.reply_text(
+            "درخواست ارسال رسید معتبر نیست؛ از «💰 وضعیت مالی من» اقدام کنید.", reply_markup=main_kb(uid)
+        )
+    inv = db.get_invoice(st[2])
     ctx.user_data.clear()
+    if not inv or inv["status"] != "unpaid" or uid not in db.account_user_ids(inv["user_id"]):
+        return await update.message.reply_text("این صورتحساب دیگر پرداخت‌نشده نیست.", reply_markup=main_kb(uid))
     try:
-        rid = db.add_receipt(completed[0]["id"], uid, kind, file_id, file_uid, text)
+        rid = db.add_receipt(db.invoice_anchor_order(inv), uid, kind, file_id, file_uid, text, invoice_id=inv["id"])
     except ValueError:
         return await update.message.reply_text(
-            "یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.",
+            "یک رسید برای این صورتحساب در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.",
             reply_markup=main_kb(uid),
         )
     await update.message.reply_text(
-        "✅ رسید پرداخت کل بدهی شما دریافت شد و برای بررسی ارسال شد. پس از تأیید مدیر، مانده حساب به‌روزرسانی می‌شود.",
+        f"✅ رسید پرداخت صورتحساب #{inv['id']} دریافت شد و برای بررسی ارسال شد. "
+        "پس از تأیید مدیر، به شما اطلاع داده می‌شود.",
         reply_markup=main_kb(uid),
     )
     await notify_receipt(ctx, rid)
@@ -689,17 +824,24 @@ async def finish_approval(msg, ctx, rid, amount, uid):
     if not res:
         return await msg.reply_text("این رسید قبلاً بررسی شده است.")
     label = "بدهکار" if res["balance"] > 0 else "بستانکار" if res["balance"] < 0 else "تسویه"
+    extra = []
+    for inv_id, _take, full in res["allocations"]:
+        inv = db.get_invoice(inv_id)
+        if full:
+            extra.append(f"🧾 صورتحساب #{inv_id} تسویه شد ✅")
+        else:
+            extra.append(f"🧾 صورتحساب #{inv_id}: مانده {money(inv['amount'] - inv['paid_amount'])}")
     await msg.reply_text(
-        f"✅ رسید پرداخت کل حساب #{rid} تأیید شد.\n"
-        f"مبلغ ثبت‌شده: {amount:,} ریال\n"
-        f"جمع پرداختی‌های مشتری: {res['paid']:,} ریال\n"
-        f"مانده کل حساب: {abs(res['balance']):,} ریال ({label})"
+        "\n".join(
+            [f"✅ رسید #{rid} تأیید شد.", f"مبلغ ثبت‌شده: {money(amount)}"]
+            + extra
+            + [f"مانده کل حساب: {abs(res['balance']):,} تومان ({label})"]
+        )
     )
     try:
         await ctx.bot.send_message(
             res["user_id"],
-            f"✅ پرداخت کل بدهی شما تأیید شد.\nمبلغ ثبت‌شده: {amount:,} ریال\n"
-            f"مانده حساب: {abs(res['balance']):,} ریال ({label})",
+            "\n".join(["✅ پرداخت شما تأیید شد.", f"مبلغ ثبت‌شده: {money(amount)}"] + extra),
         )
     except TelegramError:
         pass
@@ -716,14 +858,15 @@ ACT_PERM = {
     "cap": "cap", "captog": "cap", "capset": "cap", "rate": "cap",
     "faq": "faq", "fq": "faq", "fqadd": "faq", "fqq": "faq", "fqe": "faq", "fqd": "faq", "fqdy": "faq",
     "bc": "broadcast", "bcy": "broadcast", "bcc": "broadcast",
-    "rt": "rates", "rte": "rates", "rtn": "rates",
+    "rt": "rates", "rtn": "rates",
+    "invy": "pay", "invt": "pay", "inva": "pay", "invc": "pay",
 }  # fmt: skip
 STATE_PERM = {
     "a_search": "view", "a_edit": "edit", "a_note": "note", "a_paid": "pay", "a_user_paid": "pay", "a_rc_amount": "pay",
-    "a_symrate": "rates",
+    "a_symrate": "rates", "a_inv_text": "pay", "a_inv_amt": "pay",
     "a_cap_set": "cap", "a_rate": "cap", "a_faq_add_q": "faq", "a_faq_add_a": "faq",
     "a_faq_edit": "faq", "a_restore": "backup", "a_restore_confirm": "backup",
-    "a_bc": "broadcast", "a_bc_confirm": "broadcast", "a_rates": "rates",
+    "a_bc": "broadcast", "a_bc_confirm": "broadcast",
 }  # fmt: skip
 NO_ACCESS = "⛔ دسترسی شما برای این بخش کافی نیست."
 
@@ -779,7 +922,7 @@ def build_xlsx(status=None, days=0) -> io.BytesIO:
     ws.sheet_view.rightToLeft = True
     header = ["کد رهگیری", "وضعیت", "زمان ثبت", "آخرین تغییر", "یوزرنیم", "آیدی تلگرام"]
     header += [f["label"] for f in config.FORM_FIELDS]
-    header += ["کارمزد / بدهی (ریال)", "مبلغ دریافتی (ریال)", "مانده (ریال)"]
+    header += ["کارمزد / بدهی (تومان)", "مبلغ دریافتی (تومان)", "مانده (تومان)"]
     _put(ws, header, bold=True)
 
     by_status, by_symbol, by_day = {}, {}, {}
@@ -826,6 +969,10 @@ def build_xlsx(status=None, days=0) -> io.BytesIO:
         e[0] += 1
         e[1] += fee["commission"]
 
+    for row in ws.iter_rows(min_row=2):  # جداکننده‌ی سه‌رقمی برای مبلغ‌ها (ستون آیدی تلگرام مستثناست)
+        for c in row:
+            if isinstance(c.value, int) and c.column != 6:
+                c.number_format = "#,##0"
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for col in ws.columns:
@@ -839,13 +986,13 @@ def build_xlsx(status=None, days=0) -> io.BytesIO:
     _put(rp, ["خلاصه (بدون سفارش‌های خطادار)", "مقدار"], True)
     for k, v in [
         ("تعداد سفارش", live["n"]),
-        ("جمع بدهی / کارمزد (ریال)", live["debt"]),
-        ("جمع مبلغ دریافتی (ریال)", live["paid"]),
-        ("مانده (ریال)", live["debt"] - live["paid"]),
+        ("جمع بدهی / کارمزد (تومان)", live["debt"]),
+        ("جمع مبلغ دریافتی (تومان)", live["paid"]),
+        ("مانده (تومان)", live["debt"] - live["paid"]),
     ]:
         _put(rp, [k, v])
     rp.append([])
-    _put(rp, ["بر اساس وضعیت", "تعداد", "کارمزد (ریال)"], True)
+    _put(rp, ["بر اساس وضعیت", "تعداد", "کارمزد (تومان)"], True)
     for key, (n, c) in by_status.items():
         _put(rp, [config.STATUSES.get(key, key), n, c])
     rp.append([])
@@ -853,9 +1000,13 @@ def build_xlsx(status=None, days=0) -> io.BytesIO:
     for sym, (n, b_, s2) in sorted(by_symbol.items(), key=lambda kv: -kv[1][0]):
         _put(rp, [sym, n, b_, s2])
     rp.append([])
-    _put(rp, ["بر اساس روز", "تعداد", "کارمزد (ریال)"], True)
+    _put(rp, ["بر اساس روز", "تعداد", "کارمزد (تومان)"], True)
     for d, (n, c) in sorted(by_day.items()):
         _put(rp, [d, n, c])
+    for row in rp.iter_rows():
+        for c in row:
+            if isinstance(c.value, int):
+                c.number_format = "#,##0"
     for col in rp.columns:
         rp.column_dimensions[col[0].column_letter].width = 26
 
@@ -929,7 +1080,7 @@ async def admin_cb(q, ctx, p):
             username = f"@{user['username']}" if user["username"] else f"ID {user['user_id']}"
             receipt_mark = " 🧾" if pending else ""
             kb.append([B(
-                f"{username} | {abs(bal):,} ریال ({label}){receipt_mark}",
+                f"{username} | {abs(bal):,} تومان ({label}){receipt_mark}",
                 callback_data=f"a:usr:{user['user_id']}",
             )])
         nav = []
@@ -964,6 +1115,7 @@ async def admin_cb(q, ctx, p):
         pending = db.count_pending_receipts(user_id=user_id)
         receipts = db.list_user_receipts(user_id, 5)
         account_payments = db.list_account_payments(user_id, 5)
+        invs = db.list_unpaid_invoices(user_id)
         lines = [
             "👤 <b>پرونده مالی مشتری</b>",
             f"نام: {esc(name)}",
@@ -974,10 +1126,12 @@ async def admin_cb(q, ctx, p):
             f"عضویت: {fmt_time(user['first_seen'])}",
             "",
             f"تعداد سفارش‌ها: {len(orders)}",
-            f"جمع بدهی: <b>{finance['debt']:,} ریال</b>",
-            f"جمع پرداختی: <b>{finance['paid']:,} ریال</b>",
-            f"مانده: <b>{abs(balance):,} ریال ({status})</b>",
+            f"جمع بدهی: <b>{finance['debt']:,} تومان</b>",
+            f"جمع پرداختی: <b>{finance['paid']:,} تومان</b>",
+            f"مانده: <b>{abs(balance):,} تومان ({status})</b>",
             f"رسید در انتظار بررسی: {pending}",
+            f"صورتحساب‌های پرداخت‌نشده: {len(invs)}"
+            + (f" | جمع مانده: {money(sum(i['amount'] - i['paid_amount'] for i in invs))}" if invs else ""),
         ]
         if receipts or account_payments:
             lines += ["", "<b>آخرین پرداخت‌ها و رسیدها</b>"]
@@ -988,10 +1142,13 @@ async def admin_cb(q, ctx, p):
                         f"{RECEIPT_LABELS.get(receipt['status'], receipt['status'])}"
                     )
             for payment in account_payments:
-                source = "پرداخت دستی مدیر" if payment["source"] == "manual" else "پرداخت تأییدشده"
+                if payment["source"] == "manual" and str(payment.get("note") or "").startswith("تخفیف"):
+                    source = "تخفیف صورتحساب"
+                else:
+                    source = "پرداخت دستی مدیر" if payment["source"] == "manual" else "پرداخت تأییدشده"
                 lines.append(
                     f"{source} #{payment['id']} | {fmt_time(payment['created_at'])} | "
-                    f"{payment['amount']:,} ریال"
+                    f"{payment['amount']:,} تومان"
                 )
         kb = []
         if pending:
@@ -1000,7 +1157,7 @@ async def admin_cb(q, ctx, p):
             kb.append([B("📋 مشاهده سفارش‌های مشتری", callback_data=f"a:uhist:{user_id}")])
             done = next((r for r in orders if r["status"] == "done"), None)
             if done and can(uid, "pay"):
-                kb.append([B("📨 ارسال صورتحساب کل", callback_data=f"a:inv:{done['id']}")])
+                kb.append([B("🧾 صدور صورتحساب", callback_data=f"a:inv:{done['id']}")])
         if can(uid, "pay"):
             kb.append([B("➕ ثبت پرداخت دستی برای کل حساب", callback_data=f"a:upay:{user_id}")])
         kb.append([B("⬅️ فهرست کاربران", callback_data="a:users:all:0")])
@@ -1151,9 +1308,9 @@ async def admin_cb(q, ctx, p):
             f"🆕 ثبت‌شده: {len(rows) - n_err}\n"
             f"⚠️ دارای خطا: {n_err}\n\n"
             "💰 <b>حساب مالی</b> (بدون سفارش‌های خطادار)\n"
-            f"جمع بدهی (کارمزدها): {s['debt']:,} ریال\n"
-            f"جمع پرداختی‌ها: {s['paid']:,} ریال\n"
-            f"مانده حساب: {abs(bal):,} ریال ({bal_lbl})\n\n"
+            f"جمع بدهی (کارمزدها): {s['debt']:,} تومان\n"
+            f"جمع پرداختی‌ها: {s['paid']:,} تومان\n"
+            f"مانده حساب: {abs(bal):,} تومان ({bal_lbl})\n\n"
             f"اولین سفارش: {fmt_time(rows[-1]['created_at'])}"
         )
         kb = [order_button(r) for r in rows[:15]]
@@ -1167,8 +1324,8 @@ async def admin_cb(q, ctx, p):
         ctx.user_data["state"] = ("a_user_paid", user_id)
         await q.message.reply_text(
             f"ثبت پرداخت دستی برای کل حساب مشتری\n"
-            f"مانده فعلی: {abs(finance['balance']):,} ریال\n"
-            "مبلغ پرداخت‌شده را به ریال و فقط با عدد بفرستید:",
+            f"مانده فعلی: {abs(finance['balance']):,} تومان\n"
+            "مبلغ پرداخت‌شده را به تومان و فقط با عدد بفرستید:",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
         )
 
@@ -1178,40 +1335,69 @@ async def admin_cb(q, ctx, p):
             return await show(q, "سفارش پیدا نشد.", admin_kb(uid))
         await show(q, render_order(o, admin=True, reveal=can(uid, "secret")), pay_kb(o))
 
-    elif act == "inv":
-        oid = int(p[1])
-        o = db.get_order(oid)
-        if not o or o["status"] != "done":
-            return await q.message.reply_text("برای این سفارش هنوز صورتحساب قابل ارسال نیست.")
+    elif act == "inv":  # a:inv:<order_id> → پیش‌نویس صورتحساب
+        o = db.get_order(int(p[1]))
+        if not o:
+            return await q.message.reply_text("سفارش پیدا نشد.")
+        await start_invoice(q.message, ctx, o["user_id"])
 
-        # صورتحساب تجمیعی حساب تلگرام مشتری؛ پرداخت‌های تأییدشده‌ی دفتر کل هم لحاظ می‌شوند.
-        finance = db.user_finance(o["user_id"])
-        completed_count = sum(1 for row, _ in finance["items"] if row["status"] == "done")
-        if not completed_count:
-            return await q.message.reply_text("برای این مشتری سفارش تکمیل‌شده‌ای جهت صدور صورتحساب وجود ندارد.")
-
-        total_debt = finance["debt"]
-        total_paid = finance["paid"]
-        balance = finance["balance"]
-        balance_label = "بدهکار" if balance > 0 else "بستانکار" if balance < 0 else "تسویه"
-        invoice = (
-            "🧾 <b>صورتحساب کل مشتری</b>\n"
-            f"تعداد سفارش‌های انجام‌شده: <b>{completed_count}</b>\n"
-            f"جمع کل بدهی (کارمزدها): <b>{total_debt:,} ریال</b>\n"
-            f"جمع پرداختی‌ها: {total_paid:,} ریال\n"
-            "━━━━━━━━━━━━━━\n"
-            f"<b>مانده بدهی مشتری: {abs(balance):,} ریال ({balance_label})</b>"
-        )
-        try:
-            await ctx.bot.send_message(o["user_id"], invoice, parse_mode="HTML")
-            await q.message.reply_text("صورتحساب کل مشتری با موفقیت ارسال شد.")
-        except TelegramError:
-            await q.message.reply_text("ارسال صورتحساب ناموفق بود؛ احتمالاً مشتری ربات را مسدود کرده است.")
+    elif act in ("invy", "invt", "inva", "invc"):
+        inv = ctx.user_data.get("inv")
+        if not inv:
+            return await q.message.reply_text("درخواست منقضی شده؛ دوباره «🧾 صدور صورتحساب» را بزنید.")
+        if act == "invc":
+            ctx.user_data.pop("inv", None)
+            ctx.user_data.pop("state", None)
+            try:
+                await q.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            return await q.message.reply_text("صدور صورتحساب لغو شد.", reply_markup=main_kb(uid))
+        if act == "invt":
+            ctx.user_data["state"] = ("a_inv_text",)
+            await q.message.reply_text(
+                "متن جدید صورتحساب را بفرستید. متن فعلی (برای کپی و ویرایش):\n\n" + inv["text"],
+                reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
+            )
+        elif act == "inva":
+            ctx.user_data["state"] = ("a_inv_amt",)
+            await q.message.reply_text(
+                "مبلغ نهایی صورتحساب را به «تومان» و فقط با عدد بفرستید.\n"
+                f"حداکثر {inv['default']:,} تومان (مبلغ پیشنهادی)؛ عدد کمتر یعنی تخفیف.",
+                reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
+            )
+        else:  # invy
+            res = db.create_invoice(inv["user_id"], inv["text"], inv["amount"], inv["default"], uid)
+            if not res:
+                ctx.user_data.pop("inv", None)
+                return await q.message.reply_text(
+                    "وضعیت حساب مشتری از زمان تهیه‌ی پیش‌نویس تغییر کرده است؛ لطفاً صدور صورتحساب را دوباره شروع کنید."
+                )
+            ctx.user_data.pop("inv", None)
+            try:
+                await q.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            try:
+                await ctx.bot.send_message(
+                    inv["user_id"],
+                    f"{inv['text']}\n\n🧾 شماره صورتحساب: {res['id']}",
+                    reply_markup=M([[B("🧾 ارسال رسید پرداخت", callback_data=f"rc:{res['id']}")]]),
+                )
+                note = f"✅ صورتحساب #{res['id']} برای مشتری ارسال شد."
+            except TelegramError:
+                note = (
+                    f"⚠️ صورتحساب #{res['id']} ثبت شد ولی ارسال پیام ناموفق بود (احتمالاً مشتری ربات را مسدود کرده). "
+                    "مشتری در صورت بازگشت، آن را در «وضعیت مالی من» می‌بیند."
+                )
+            if res["discount"]:
+                note += f"\nتخفیف ثبت‌شده در حساب مشتری: {money(res['discount'])}"
+            await q.message.reply_text(note, reply_markup=main_kb(uid))
 
     elif act == "pa":
         ctx.user_data["state"] = ("a_paid", int(p[1]))
         await q.message.reply_text(
-            "مبلغ دریافتی از مشتری را به ریال و فقط با عدد بفرستید (۰ = هیچ):",
+            "مبلغ دریافتی از مشتری را به تومان و فقط با عدد بفرستید (۰ = هیچ):",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
         )
 
@@ -1234,29 +1420,31 @@ async def admin_cb(q, ctx, p):
             return await q.message.reply_text(f"این رسید قبلاً {RECEIPT_LABELS[r['status']]} شده است.")
         o = db.get_order(r["order_id"])
         summary = db.user_finance(r["user_id"])
+        inv = db.get_invoice(r["invoice_id"]) if r["invoice_id"] else None
+        default_amt = inv["amount"] - inv["paid_amount"] if inv else summary["balance"]
         if act == "rca":
             rows = []
-            if summary["balance"] > 0:
-                rows.append([B(f"✅ ثبت کل مانده ({summary['balance']:,} ریال)", callback_data=f"a:rcf:{rid}")])
+            if default_amt > 0:
+                rows.append([B(f"✅ ثبت مبلغ صورتحساب ({default_amt:,} تومان)", callback_data=f"a:rcf:{rid}")])
             rows.append([B("✏️ مبلغ دیگر", callback_data=f"a:rcm:{rid}")])
             await q.message.reply_text(
-                f"تأیید رسید کل حساب #{rid}\n"
-                f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} ریال\n\n"
+                f"تأیید رسید #{rid}" + (f" — صورتحساب #{inv['id']}" if inv else " (کل حساب)") + "\n"
+                f"جمع بدهی: {summary['debt']:,} | پرداختی قبلی: {summary['paid']:,} | مانده کل: {summary['balance']:,} تومان\n\n"
                 "چه مبلغی از این رسید ثبت شود؟",
                 reply_markup=M(rows),
             )
         elif act == "rcf":
-            if summary["balance"] <= 0:
-                return await q.message.reply_text("مانده کل حساب صفر یا منفی است؛ «مبلغ دیگر» را بزنید.")
+            if default_amt <= 0:
+                return await q.message.reply_text("مبلغی برای ثبت باقی نمانده؛ «مبلغ دیگر» را بزنید.")
             try:
                 await q.edit_message_reply_markup(None)
             except TelegramError:
                 pass
-            await finish_approval(q.message, ctx, rid, summary["balance"], uid)
+            await finish_approval(q.message, ctx, rid, default_amt, uid)
         elif act == "rcm":
             ctx.user_data["state"] = ("a_rc_amount", rid)
             await q.message.reply_text(
-                f"مبلغ دریافتی رسید #{rid} را به ریال و فقط با عدد بفرستید:",
+                f"مبلغ دریافتی رسید #{rid} را به تومان و فقط با عدد بفرستید:",
                 reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
             )
         else:  # rcr
@@ -1271,7 +1459,7 @@ async def admin_cb(q, ctx, p):
             try:
                 await ctx.bot.send_message(
                     r["user_id"],
-                    "❌ رسید پرداخت کل حساب شما پذیرفته نشد. لطفاً پس از بررسی، رسید صحیح را از بخش «وضعیت مالی» دوباره ارسال کنید.",
+                    "❌ رسید پرداخت شما پذیرفته نشد. لطفاً رسید صحیح را از بخش «💰 وضعیت مالی من» (زیر همان صورتحساب) دوباره ارسال کنید.",
                 )
             except TelegramError:
                 pass
@@ -1283,33 +1471,22 @@ async def admin_cb(q, ctx, p):
         for r in pend:
             await notify_receipt(ctx, r["id"], only=[uid])
 
-    # ---- commission rates text (shown to customers) ----
+    # ---- commission rates (همان فهرستی که مشتری می‌بیند) ----
     elif act == "rt":
-        cur = db.get_rates_text()
-        sr = "\n".join(f"• {esc(sym)}: {rate:g}٪" for sym, rate in db.list_symbol_rates()) or "هنوز نرخ نمادی ثبت نشده است."
-        kb = M([
-            [B("➕ ثبت نرخ نماد", callback_data="a:rtn")],
-            [B("✏️ ویرایش متن نرخ‌های نمایشی", callback_data="a:rte")],
-            [B("🏠 پنل", callback_data="a:home")],
-        ])
+        lines = rates_lines()
+        kb = M([[B("➕ ثبت / ویرایش / حذف نرخ نماد", callback_data="a:rtn")], [B("🏠 پنل", callback_data="a:home")]])
         await show(
             q,
-            "💹 <b>نرخ کارمزد نمادها</b> (برای محاسبه خودکار فاکتور)\n\n" + sr
-            + "\n\n<b>متنی که مشتری می‌بیند:</b>\n" + (esc(cur) if cur else "هنوز ثبت نشده."),
+            "💹 <b>نرخ کارمزد سهام‌ها</b>\n(دقیقاً همین فهرست به مشتری نمایش داده می‌شود و کارمزد سفارش‌ها هم از آن محاسبه می‌شود)\n\n"
+            + (esc("\n".join(lines)) if lines else "هنوز نرخی ثبت نشده است."),
             kb,
         )
 
     elif act == "rtn":
         ctx.user_data["state"] = ("a_symrate",)
         await q.message.reply_text(
-            "نام نماد و درصد کارمزد را بفرستید. مثال: فولاد 2",
-            reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
-        )
-
-    elif act == "rte":
-        ctx.user_data["state"] = ("a_rates",)
-        await q.message.reply_text(
-            "متن کامل نرخ‌ها را بفرستید (جایگزین متن قبلی می‌شود):",
+            "نام نماد و درصد کارمزد را بفرستید. مثال: فولاد 2\n"
+            "برای حذف نرخ یک نماد: فولاد حذف",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
         )
 
@@ -1549,7 +1726,7 @@ async def admin_text(update, ctx, raw, st):
     elif kind == "a_user_paid":
         v = fa2en(raw).replace(",", "").replace(" ", "")
         if not v.isdigit() or not 0 < int(v) <= 10**13:
-            return await msg.reply_text("لطفاً مبلغ مثبت و معتبر را به ریال وارد کنید.")
+            return await msg.reply_text("لطفاً مبلغ مثبت و معتبر را به تومان وارد کنید.")
         user_id = st[1]
         db.add_manual_customer_payment(user_id, int(v), uid, "ثبت دستی توسط مدیر")
         ctx.user_data.clear()
@@ -1557,9 +1734,9 @@ async def admin_text(update, ctx, raw, st):
         bal = finance["balance"]
         label = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
         await msg.reply_text(
-            f"پرداخت دستی {int(v):,} ریال ثبت شد.\n"
-            f"جمع پرداختی‌ها: {finance['paid']:,} ریال\n"
-            f"مانده کل: {abs(bal):,} ریال ({label})",
+            f"پرداخت دستی {int(v):,} تومان ثبت شد.\n"
+            f"جمع پرداختی‌ها: {finance['paid']:,} تومان\n"
+            f"مانده کل: {abs(bal):,} تومان ({label})",
             reply_markup=main_kb(uid),
         )
         await msg.reply_text(
@@ -1570,7 +1747,7 @@ async def admin_text(update, ctx, raw, st):
     elif kind == "a_paid":
         v = fa2en(raw).replace(",", "").replace(" ", "")
         if not v.isdigit() or int(v) > 10**13:
-            return await msg.reply_text("لطفاً فقط عدد (ریال، بدون حروف) بفرستید.")
+            return await msg.reply_text("لطفاً فقط عدد (تومان، بدون حروف) بفرستید.")
         oid = st[1]
         db.set_paid_amount(oid, int(v), uid)
         ctx.user_data.clear()
@@ -1581,6 +1758,12 @@ async def admin_text(update, ctx, raw, st):
 
     elif kind == "a_symrate":
         parts = fa2en(raw).replace("٪", "").replace("%", "").replace("٫", ".").split()
+        if len(parts) >= 2 and parts[-1] in ("حذف", "-"):
+            ok = db.delete_symbol_rate(" ".join(parts[:-1]))
+            ctx.user_data.clear()
+            return await msg.reply_text(
+                "نرخ این نماد حذف شد ✅" if ok else "برای این نماد نرخی ثبت نشده بود.", reply_markup=main_kb(uid)
+            )
         try:
             pct, sym = float(parts[-1]), " ".join(parts[:-1]).strip()
         except (ValueError, IndexError):
@@ -1607,17 +1790,42 @@ async def admin_text(update, ctx, raw, st):
     elif kind == "a_rc_amount":
         v = fa2en(raw).replace(",", "").replace(" ", "")
         if not v.isdigit() or not 0 < int(v) <= 10**13:
-            return await msg.reply_text("لطفاً فقط عدد (ریال، بزرگ‌تر از صفر) بفرستید.")
+            return await msg.reply_text("لطفاً فقط عدد (تومان، بزرگ‌تر از صفر) بفرستید.")
         ctx.user_data.clear()
         await msg.reply_text("در حال ثبت…", reply_markup=main_kb(uid))
         await finish_approval(msg, ctx, st[1], int(v), uid)
 
-    elif kind == "a_rates":
-        if not raw or len(raw) > 3500:
-            return await msg.reply_text("متن خالی یا بیش از ۳۵۰۰ کاراکتر است.")
-        db.set_rates_text(raw)
-        ctx.user_data.clear()
-        await msg.reply_text("ذخیره شد ✅ مشتری‌ها از «💹 نرخ کارمزد» همین متن را می‌بینند.", reply_markup=main_kb(uid))
+    elif kind == "a_inv_text":
+        inv = ctx.user_data.get("inv")
+        if not inv:
+            ctx.user_data.clear()
+            return await msg.reply_text("درخواست منقضی شده؛ دوباره صدور صورتحساب را شروع کنید.", reply_markup=main_kb(uid))
+        if not raw or len(raw) > 3000:
+            return await msg.reply_text("متن خالی یا بیش از ۳۰۰۰ کاراکتر است.")
+        inv["text"], inv["edited"] = raw, True
+        ctx.user_data.pop("state", None)
+        await msg.reply_text("متن ثبت شد ✅", reply_markup=main_kb(uid))
+        text, kb = invoice_preview(inv)
+        await msg.reply_text(text, reply_markup=kb)
+
+    elif kind == "a_inv_amt":
+        inv = ctx.user_data.get("inv")
+        if not inv:
+            ctx.user_data.clear()
+            return await msg.reply_text("درخواست منقضی شده؛ دوباره صدور صورتحساب را شروع کنید.", reply_markup=main_kb(uid))
+        v = fa2en(raw).replace(",", "").replace(" ", "")
+        if not v.isdigit() or not 0 < int(v) <= inv["default"]:
+            return await msg.reply_text(f"عدد معتبر بین ۱ و {inv['default']:,} (تومان) بفرستید.")
+        inv["amount"] = int(v)
+        note = "مبلغ ثبت شد ✅"
+        if inv["edited"]:
+            note += "\nمتن را قبلاً دستی ویرایش کرده‌اید و تغییر نکرد؛ در صورت نیاز «ویرایش متن» را بزنید."
+        else:
+            inv["text"] = invoice_default_text(inv["name"], inv["count"], inv["amount"])
+        ctx.user_data.pop("state", None)
+        await msg.reply_text(note, reply_markup=main_kb(uid))
+        text, kb = invoice_preview(inv)
+        await msg.reply_text(text, reply_markup=kb)
 
     elif kind == "a_bc":
         if not raw or len(raw) > 3500:
@@ -1712,29 +1920,66 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         o = db.get_order(int(d[3:]))
         # مشتری فقط سفارش خودش را می‌بیند
         if o and o["user_id"] == uid:
-            await q.message.reply_text(render_order(o), parse_mode="HTML")
+            await q.message.reply_text(
+                render_order(o),
+                parse_mode="HTML",
+                reply_markup=M([[B("🔁 ثبت دوباره‌ی این سفارش", callback_data=f"pf:re:{o['id']}")]]),
+            )
+        return
+
+    if d.startswith("pf:"):
+        if is_admin(uid):
+            return
+        parts = d.split(":")
+        act = parts[1]
+        try:
+            await q.edit_message_reply_markup(None)
+        except TelegramError:
+            pass
+        if act == "del":
+            db.delete_profile(uid)
+            return await q.message.reply_text("اطلاعات ذخیره‌شده حذف شد.", reply_markup=main_kb(uid))
+        blocked = order_block_msg(uid)
+        if blocked:
+            return await q.message.reply_text(blocked, reply_markup=main_kb(uid))
+        profile = db.get_profile(uid)
+        if act == "use":
+            return await begin_form(q.message, ctx, form=profile, skip=profile.keys(), defaults=profile)
+        if act == "edit":
+            return await begin_form(q.message, ctx, defaults=profile)
+        if act == "new":
+            return await begin_form(q.message, ctx)
+        if act == "re" and len(parts) == 3 and parts[2].isdigit():
+            o = db.get_order(int(parts[2]))
+            if not o or o["user_id"] != uid:
+                return
+            old = json.loads(o["data"])
+            data = {f["key"]: old[f["key"]] for f in config.FORM_FIELDS if f["kind"] != "secret" and old.get(f["key"])}
+            return await begin_form(q.message, ctx, form=data, skip=data.keys(), defaults=data)
         return
 
     if d == "fin":
         if is_admin(uid):
             return
-        text, kb = fin_view(uid)
-        return await show(q, text, kb)
+        return await send_fin(q.message, uid)
 
-    if d == "rc:all":
+    if d.startswith("rc:"):
         if is_admin(uid):
             return
-        summary = db.user_finance(uid)
-        if summary["balance"] <= 0:
-            return await q.message.reply_text("در حال حاضر بدهی پرداخت‌نشده‌ای ندارید.")
-        if db.count_pending_receipts(user_id=uid):
-            return await q.message.reply_text("یک رسید شما در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.")
+        key = d[3:]
+        inv = db.get_invoice(int(key)) if key.isdigit() else None
+        if not inv:
+            return await q.message.reply_text("برای ارسال رسید، از «💰 وضعیت مالی من» و زیر صورتحساب اقدام کنید.")
+        if inv["status"] != "unpaid" or uid not in db.account_user_ids(inv["user_id"]):
+            return await q.message.reply_text("این صورتحساب دیگر پرداخت‌نشده نیست.")
+        if db.count_pending_receipts(invoice_id=inv["id"]):
+            return await q.message.reply_text("یک رسید برای این صورتحساب در انتظار بررسی است؛ لطفاً تا اعلام نتیجه صبر کنید.")
         ctx.user_data.clear()
-        ctx.user_data["state"] = ("receipt", uid)
+        ctx.user_data["state"] = ("receipt", uid, inv["id"])
         return await q.message.reply_text(
-            f"🧾 ارسال رسید پرداخت کل حساب\nمبلغ بدهی فعلی: {summary['balance']:,} ریال\n\n"
-            "عکس یا فایل (PDF) رسید پرداخت کل بدهی را بفرستید؛ "
-            "می‌توانید شماره پیگیری را در توضیح (کپشن) بنویسید.\n"
+            f"🧾 ارسال رسید پرداخت — صورتحساب #{inv['id']}\n"
+            f"مبلغ قابل پرداخت: {money(inv['amount'] - inv['paid_amount'])}\n\n"
+            "عکس یا فایل (PDF) رسید پرداخت را بفرستید؛ می‌توانید شماره پیگیری را در توضیح (کپشن) بنویسید.\n"
             "اگر عکس ندارید، فقط شماره پیگیری بانکی را به‌صورت متن بفرستید.",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
         )
@@ -1780,6 +2025,9 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "برای پیگیری از منوی «پیگیری سفارش» استفاده کنید.",
             reply_markup=main_kb(uid),
         )
+        prof = {f["key"]: data[f["key"]] for f in config.FORM_FIELDS if f.get("remember") and data.get(f["key"])}
+        if prof:
+            db.save_profile(uid, prof)
         await notify_admins(ctx, db.get_order(oid))
         st = db.intake_state()
         if st["capacity"] and st["remaining"] == 0:
