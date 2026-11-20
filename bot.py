@@ -111,8 +111,6 @@ def main_kb(uid):
     if is_admin(uid):  # پنل ادمین جدا از پنل مشتری است؛ دکمه‌های پنل همیشه پایین صفحه‌اند
         return admin_reply_kb(uid)
     rows = [[BTN_ORDER, BTN_TRACK], [BTN_MY, BTN_FIN], [BTN_RATES, BTN_FAQ]]
-    if is_admin(uid):
-        rows.append([BTN_ADMIN])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -328,7 +326,7 @@ async def begin_form(msg, ctx, form=None, skip=(), defaults=None):
     ctx.user_data.update(
         state=("form",), idx=0, form=dict(form or {}), skip=set(skip), defaults=dict(defaults or {})
     )
-    await msg.reply_text("⚠️. پیام حاوی «کلمه عبور» بعد از دریافت از چت پاک می‌شود.")
+    await msg.reply_text("⚠️ پیام حاوی «کلمه عبور» بعد از دریافت از چت پاک می‌شود.")
     i = next_idx(ctx, 0)
     if i >= len(config.FORM_FIELDS):
         return await send_confirm(msg, ctx)
@@ -405,7 +403,6 @@ async def form_step(update, ctx, raw):
 
 
 MY_PAGE = 8
-TOP_N = 3  # تعداد سفارش‌های نمایش‌داده‌شده به‌طور پیش‌فرض در لیست مدیر
 
 
 def my_orders_view(uid, page):
@@ -468,8 +465,12 @@ def rates_lines():
     """فهرست نرخ نمادها؛ همین فهرست هم به مشتری و هم به مدیر نشان داده می‌شود."""
     lines = [f"• {sym}: {rate:g}٪" for sym, rate in db.list_symbol_rates()]
     default = db.get_commission_percent()
-    if lines and default > 0:
-        lines += ["", f"سایر نمادها: {default:g}٪"]
+    if default > 0:
+        if lines:
+            lines.append("")
+            lines.append(f"سایر نمادها: {default:g}٪")
+        else:
+            lines.append(f"نرخ کارمزد همه‌ی نمادها: {default:g}٪")
     return lines
 
 
@@ -1642,7 +1643,6 @@ async def admin_cb(q, ctx, p):
 
     elif act == "fqdy":
         db.faq_delete(int(p[1]))
-        q.data = "a:faq"
         await admin_cb(q, ctx, ["faq"])
 
 
