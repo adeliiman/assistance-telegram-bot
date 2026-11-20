@@ -950,16 +950,6 @@ def customer_summary(order) -> dict:
     return {"debt": debt, "paid": paid, "balance": debt - paid}
 
 
-def get_rates_text() -> str:
-    with conn() as c:
-        return _get(c, "rates_text", "")
-
-
-def set_rates_text(text: str):
-    with conn() as c:
-        _set(c, "rates_text", text)
-
-
 # ---------------- customer history ----------------
 def customer_orders(order):
     """همه‌ی سفارش‌های همین مشتری (همان آیدی تلگرام یا همان شماره موبایل)، جدیدترین اول."""
