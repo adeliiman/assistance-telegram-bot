@@ -111,6 +111,25 @@ def init_db():
               actor_id INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_manual_customer_payments_user ON manual_customer_payments(user_id);
+            CREATE TABLE IF NOT EXISTS invoices(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,          -- گیرنده‌ی صورتحساب (آیدی تلگرام)
+              text TEXT NOT NULL,                -- متن ارسال‌شده برای مشتری
+              amount INTEGER NOT NULL,           -- مبلغ قابل پرداخت (تومان، بعد از تخفیف)
+              discount INTEGER NOT NULL DEFAULT 0,
+              paid_amount INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'unpaid',   -- unpaid | paid
+              order_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              created_by INTEGER NOT NULL,
+              paid_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_invoices_user ON invoices(user_id);
+            CREATE TABLE IF NOT EXISTS profiles(
+              user_id INTEGER PRIMARY KEY,
+              data TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             """
         )
         # مهاجرت ساختار: ستون‌های پرداخت و کارمزد (روی دیتابیس‌ها و بکاپ‌های قدیمی هم کار می‌کند)
@@ -123,6 +142,11 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN trade_amount INTEGER")
         if "fee_rate" not in cols:
             c.execute("ALTER TABLE orders ADD COLUMN fee_rate REAL")
+        if "invoice_id" not in cols:  # سفارشی که در یک صورتحساب آمده
+            c.execute("ALTER TABLE orders ADD COLUMN invoice_id INTEGER")
+        rcols = {r["name"] for r in c.execute("PRAGMA table_info(receipts)")}
+        if "invoice_id" not in rcols:
+            c.execute("ALTER TABLE receipts ADD COLUMN invoice_id INTEGER")
         # هماهنگ‌سازی با وضعیت‌های جدید (روی دیتابیس‌ها و بکاپ‌های قدیمی هم کار می‌کند)
         c.execute("UPDATE orders SET status='new' WHERE status IN ('in_progress')")
         c.execute("UPDATE orders SET status='error' WHERE status='canceled'")
@@ -174,6 +198,12 @@ def symbol_rate(symbol):
 def set_symbol_rate(symbol, percent: float):
     with conn() as c:
         _set(c, "symrate:" + _norm_sym(symbol), percent)
+
+
+def delete_symbol_rate(symbol) -> bool:
+    with conn() as c:
+        cur = c.execute("DELETE FROM settings WHERE key=?", ("symrate:" + _norm_sym(symbol),))
+        return cur.rowcount > 0
 
 
 def list_symbol_rates():
@@ -451,7 +481,7 @@ def _to_int(v) -> int:
 
 
 def order_total(o) -> int:
-    """مبلغ سفارش را از اطلاعات ثبت‌شده استخراج می‌کند (همه مبالغ ریال هستند).
+    """مبلغ سفارش را از اطلاعات ثبت‌شده استخراج می‌کند (همه مبالغ تومان هستند).
 
     اگر تعداد و قیمت موجود باشند، ارزش معامله از حاصل‌ضرب آن‌ها محاسبه می‌شود؛
     در نسخه‌هایی که فیلد قیمت ندارند، قدرت خرید ثبت‌شده مبنا قرار می‌گیرد.
@@ -539,28 +569,35 @@ def add_manual_customer_payment(user_id, amount: int, actor_id, note=""):
             account_ids,
         ).fetchone()
         if order:
-            _log(c, order["id"], actor_id, "manual_customer_payment", f"+{amount} ریال")
+            _log(c, order["id"], actor_id, "manual_customer_payment", f"+{amount} تومان")
+        _allocate(c, account_ids, amount)
         return cur.lastrowid
 
 
-def add_receipt(order_id, user_id, kind, file_id=None, file_uid=None, text=None) -> int:
-    """ثبت یک رسید برای کل حساب؛ هم‌زمان بیش از یک رسید معلق برای مشتری مجاز نیست."""
+def add_receipt(order_id, user_id, kind, file_id=None, file_uid=None, text=None, invoice_id=None) -> int:
+    """ثبت رسید پرداخت. برای هر صورتحساب هم‌زمان فقط یک رسید معلق مجاز است
+    (رسید بدون صورتحساب = رسید قدیمی کل حساب؛ برای آن‌ها هم یک رسید معلق در هر حساب)."""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        account_ids = _account_user_ids(c, user_id)
-        marks = ",".join("?" for _ in account_ids)
-        pending = c.execute(
-            f"SELECT 1 FROM receipts WHERE user_id IN ({marks}) AND status='pending' LIMIT 1",
-            account_ids,
-        ).fetchone()
+        if invoice_id:
+            pending = c.execute(
+                "SELECT 1 FROM receipts WHERE invoice_id=? AND status='pending' LIMIT 1", (invoice_id,)
+            ).fetchone()
+        else:
+            account_ids = _account_user_ids(c, user_id)
+            marks = ",".join("?" for _ in account_ids)
+            pending = c.execute(
+                f"SELECT 1 FROM receipts WHERE user_id IN ({marks}) AND status='pending' LIMIT 1",
+                account_ids,
+            ).fetchone()
         if pending:
-            raise ValueError("customer already has a pending receipt")
+            raise ValueError("a pending receipt already exists")
         cur = c.execute(
-            "INSERT INTO receipts(order_id, user_id, kind, file_id, file_uid, text, created_at)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (order_id, user_id, kind, file_id, file_uid, text, now()),
+            "INSERT INTO receipts(order_id, user_id, kind, file_id, file_uid, text, created_at, invoice_id)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (order_id, user_id, kind, file_id, file_uid, text, now(), invoice_id),
         )
-        _log(c, order_id, user_id, "receipt", f"#{cur.lastrowid} account-wide {kind}")
+        _log(c, order_id, user_id, "receipt", f"#{cur.lastrowid} {kind} invoice={invoice_id}")
         return cur.lastrowid
 
 
@@ -569,7 +606,7 @@ def get_receipt(rid):
         return c.execute("SELECT * FROM receipts WHERE id=?", (rid,)).fetchone()
 
 
-def count_pending_receipts(user_id=None, order_id=None) -> int:
+def count_pending_receipts(user_id=None, order_id=None, invoice_id=None) -> int:
     q, args = "SELECT COUNT(*) FROM receipts WHERE status='pending'", []
     if user_id is not None:
         with conn() as c:
@@ -580,6 +617,9 @@ def count_pending_receipts(user_id=None, order_id=None) -> int:
     if order_id is not None:
         q += " AND order_id=?"
         args.append(order_id)
+    if invoice_id is not None:
+        q += " AND invoice_id=?"
+        args.append(invoice_id)
     with conn() as c:
         return c.execute(q, args).fetchone()[0]
 
@@ -649,8 +689,10 @@ def approve_receipt(rid, amount: int, actor_id):
             account_ids,
         ).fetchone()[0]
         paid = sums["legacy_paid"] + ledger + manual_ledger
+        allocations = _allocate(c, account_ids, amount, r["invoice_id"])
         return {"order_id":o["id"],"code":o["code"],"user_id":r["user_id"],
-                "paid":paid,"commission":sums["debt"],"balance":sums["debt"]-paid}
+                "paid":paid,"commission":sums["debt"],"balance":sums["debt"]-paid,
+                "allocations":allocations}
 
 
 def reject_receipt(rid, actor_id):
@@ -679,7 +721,7 @@ def list_account_payments(user_id, limit=5):
             account_ids,
         ).fetchall()
         manual = c.execute(
-            f"SELECT id, amount, 'manual' AS status, created_at, 'manual' AS source "
+            f"SELECT id, amount, 'manual' AS status, created_at, 'manual' AS source, note "
             f"FROM manual_customer_payments WHERE user_id IN ({marks})",
             account_ids,
         ).fetchall()
@@ -730,6 +772,160 @@ def user_finance(user_id) -> dict:
     legacy_paid = sum(f["paid"] for _, f in items)
     paid = legacy_paid + ledger_paid
     return {"items": items, "debt": debt, "paid": paid, "balance": debt - paid}
+
+
+# ---------------- invoices (صورتحساب؛ فقط توسط مالک صادر می‌شود) ----------------
+def _allocate(c, account_ids, amount, first_invoice_id=None):
+    """پرداخت را به صورتحساب‌های پرداخت‌نشده‌ی حساب تخصیص می‌دهد: اول صورتحساب همان رسید، بعد قدیمی‌ترین‌ها.
+    برمی‌گرداند [(invoice_id, مبلغ تخصیص‌یافته, کامل پرداخت شد؟)]."""
+    marks = ",".join("?" for _ in account_ids)
+    rows = c.execute(
+        f"SELECT * FROM invoices WHERE user_id IN ({marks}) AND status='unpaid' ORDER BY id", account_ids
+    ).fetchall()
+    rows.sort(key=lambda r: (r["id"] != first_invoice_id, r["id"]))
+    left, out = amount, []
+    for inv in rows:
+        if left <= 0:
+            break
+        take = min(inv["amount"] - inv["paid_amount"], left)
+        if take <= 0:
+            continue
+        paid = inv["paid_amount"] + take
+        full = paid >= inv["amount"]
+        c.execute(
+            "UPDATE invoices SET paid_amount=?, status=?, paid_at=? WHERE id=?",
+            (paid, "paid" if full else "unpaid", now() if full else None, inv["id"]),
+        )
+        left -= take
+        out.append((inv["id"], take, full))
+    return out
+
+
+def _invoice_draft(c, user_id) -> dict:
+    ids = _account_user_ids(c, user_id)
+    marks = ",".join("?" for _ in ids)
+    orders = c.execute(
+        f"SELECT * FROM orders WHERE user_id IN ({marks}) AND status='done' AND invoice_id IS NULL ORDER BY id", ids
+    ).fetchall()
+    sums = c.execute(
+        f"SELECT COALESCE(SUM(commission),0) debt, COALESCE(SUM(paid_amount),0) legacy"
+        f" FROM orders WHERE user_id IN ({marks}) AND status!='error'", ids
+    ).fetchone()
+    ledger = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})", ids).fetchone()[0]
+    ledger += c.execute(f"SELECT COALESCE(SUM(amount),0) FROM manual_customer_payments WHERE user_id IN ({marks})", ids).fetchone()[0]
+    balance = sums["debt"] - sums["legacy"] - ledger
+    outstanding = c.execute(
+        f"SELECT COALESCE(SUM(amount - paid_amount),0) FROM invoices WHERE user_id IN ({marks}) AND status='unpaid'", ids
+    ).fetchone()[0]
+    return {"orders": orders, "count": len(orders), "balance": balance,
+            "outstanding": outstanding, "amount": max(0, balance - outstanding)}
+
+
+def invoice_draft(user_id) -> dict:
+    """پیش‌نویس صورتحساب: سفارش‌های انجام‌شده‌ی بدون صورتحساب و مبلغ پیشنهادی (بدهی باز منهای صورتحساب‌های پرداخت‌نشده)."""
+    with conn() as c:
+        return _invoice_draft(c, user_id)
+
+
+def account_last_data(user_id) -> dict:
+    """اطلاعات آخرین سفارش این حساب (برای نام و موبایل مشتری)."""
+    with conn() as c:
+        ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in ids)
+        o = c.execute(f"SELECT data FROM orders WHERE user_id IN ({marks}) ORDER BY id DESC LIMIT 1", ids).fetchone()
+    return json.loads(o["data"]) if o else {}
+
+
+def create_invoice(user_id, text, amount, expected_default, actor_id):
+    """صدور صورتحساب. اگر مبلغ از مبلغ پیشنهادی کمتر باشد، مابه‌التفاوت به‌عنوان تخفیف در حساب مشتری ثبت می‌شود.
+    اگر وضعیت حساب از زمان پیش‌نویس تغییر کرده باشد None برمی‌گرداند."""
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        d = _invoice_draft(c, user_id)
+        if not d["count"] or d["amount"] <= 0 or d["amount"] != expected_default or not 0 < amount <= d["amount"]:
+            return None
+        discount = d["amount"] - amount
+        cur = c.execute(
+            "INSERT INTO invoices(user_id,text,amount,discount,order_count,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
+            (user_id, text, amount, discount, d["count"], now(), actor_id),
+        )
+        iid = cur.lastrowid
+        oids = [o["id"] for o in d["orders"]]
+        marks = ",".join("?" for _ in oids)
+        c.execute(f"UPDATE orders SET invoice_id=? WHERE id IN ({marks})", [iid] + oids)
+        if discount:
+            c.execute(
+                "INSERT INTO manual_customer_payments(user_id,amount,note,created_at,actor_id) VALUES(?,?,?,?,?)",
+                (user_id, discount, f"تخفیف صورتحساب #{iid}", now(), actor_id),
+            )
+        _log(c, oids[0], actor_id, "invoice", f"#{iid} amount={amount} discount={discount} orders={len(oids)}")
+        return {"id": iid, "amount": amount, "discount": discount, "count": d["count"]}
+
+
+def get_invoice(invoice_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+
+
+def list_unpaid_invoices(user_id):
+    """صورتحساب‌های پرداخت‌نشده‌ی کل حساب مشتری (قدیمی‌ترین اول)."""
+    with conn() as c:
+        ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in ids)
+        return c.execute(
+            f"SELECT * FROM invoices WHERE user_id IN ({marks}) AND status='unpaid' ORDER BY id", ids
+        ).fetchall()
+
+
+def last_invoice_receipt(invoice_id):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM receipts WHERE invoice_id=? ORDER BY id DESC LIMIT 1", (invoice_id,)
+        ).fetchone()
+
+
+def invoice_anchor_order(inv) -> int:
+    """یکی از سفارش‌های همین صورتحساب (رسید به یک سفارش وصل می‌شود)."""
+    with conn() as c:
+        o = c.execute("SELECT id FROM orders WHERE invoice_id=? ORDER BY id LIMIT 1", (inv["id"],)).fetchone()
+        if not o:
+            ids = _account_user_ids(c, inv["user_id"])
+            marks = ",".join("?" for _ in ids)
+            o = c.execute(f"SELECT id FROM orders WHERE user_id IN ({marks}) ORDER BY id DESC LIMIT 1", ids).fetchone()
+    return o["id"] if o else 0
+
+
+# ---------------- saved customer profile (پیش‌فرض فرم سفارش) ----------------
+def _remember_keys():
+    return [f["key"] for f in config.FORM_FIELDS if f.get("remember")]
+
+
+def get_profile(user_id) -> dict:
+    """اطلاعات ذخیره‌شده‌ی مشتری؛ اگر هنوز ذخیره نشده، از آخرین سفارش او ساخته می‌شود. رمز هرگز ذخیره نمی‌شود."""
+    with conn() as c:
+        r = c.execute("SELECT data FROM profiles WHERE user_id=?", (user_id,)).fetchone()
+        if r:
+            return json.loads(r["data"])
+        o = c.execute("SELECT data FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+    if not o:
+        return {}
+    d = json.loads(o["data"])
+    return {k: d[k] for k in _remember_keys() if d.get(k)}
+
+
+def save_profile(user_id, data: dict):
+    keys = _remember_keys()
+    clean = {k: v for k, v in data.items() if k in keys and v}
+    with conn() as c:
+        c.execute(
+            "INSERT INTO profiles(user_id, data, updated_at) VALUES(?,?,?)"
+            " ON CONFLICT(user_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+            (user_id, json.dumps(clean, ensure_ascii=False), now()),
+        )
+
+
+def delete_profile(user_id):
+    save_profile(user_id, {})  # ردیف خالی یعنی «حذف‌شده»؛ دوباره از سفارش قبلی ساخته نمی‌شود
 
 
 # ---------------- customer ledger / rates text ----------------
