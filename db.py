@@ -222,13 +222,11 @@ def complete_order(order_id, amount: int, actor_id):
         if not o:
             return None
         sym = json.loads(o["data"]).get("symbol", "").strip()
-        rate = _rate_for(c, sym)
-        if rate <= 0:
-            return None
-        fee = round(amount * rate / 100)
+        rate = _rate_for(c, sym)  # فقط پیشنهاد اولیه؛ نرخ نهایی هنگام صدور صورتحساب پرسیده می‌شود
+        fee = round(amount * rate / 100) if rate > 0 else 0
         c.execute(
             "UPDATE orders SET status='done', trade_amount=?, fee_rate=?, commission=?, updated_at=? WHERE id=?",
-            (amount, rate, fee, now(), order_id),
+            (amount, rate if rate > 0 else None, fee, now(), order_id),
         )
         _log(c, order_id, actor_id, "done", f"amount={amount} rate={rate} fee={fee}")
         return {
@@ -801,7 +799,9 @@ def _allocate(c, account_ids, amount, first_invoice_id=None):
     return out
 
 
-def _invoice_draft(c, user_id) -> dict:
+def _invoice_quote(c, user_id, rates):
+    """محاسبه‌ی صورتحساب با نرخ‌هایی که مالک برای هر سفارش داده (rates: {order_id: درصد}).
+    کارمزد هر سفارش = مبلغ سفارش × نرخ. اگر برای سفارشی نرخ نیامده باشد None برمی‌گرداند."""
     ids = _account_user_ids(c, user_id)
     marks = ",".join("?" for _ in ids)
     orders = c.execute(
@@ -813,18 +813,45 @@ def _invoice_draft(c, user_id) -> dict:
     ).fetchone()
     ledger = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM customer_payments WHERE user_id IN ({marks})", ids).fetchone()[0]
     ledger += c.execute(f"SELECT COALESCE(SUM(amount),0) FROM manual_customer_payments WHERE user_id IN ({marks})", ids).fetchone()[0]
-    balance = sums["debt"] - sums["legacy"] - ledger
     outstanding = c.execute(
         f"SELECT COALESCE(SUM(amount - paid_amount),0) FROM invoices WHERE user_id IN ({marks}) AND status='unpaid'", ids
     ).fetchone()[0]
-    return {"orders": orders, "count": len(orders), "balance": balance,
-            "outstanding": outstanding, "amount": max(0, balance - outstanding)}
+    items, old_fee, new_fee, base_total = [], 0, 0, 0
+    for o in orders:
+        rate = rates.get(o["id"])
+        if rate is None:
+            return None
+        d = json.loads(o["data"])
+        base = o["trade_amount"] or _amount_from_data(d)
+        fee = round(base * rate / 100)
+        items.append({"order": o, "symbol": d.get("symbol", ""), "base": base, "rate": rate, "fee": fee})
+        old_fee += o["commission"] or 0
+        new_fee += fee
+        base_total += base
+    balance = sums["debt"] - old_fee + new_fee - sums["legacy"] - ledger
+    return {"items": items, "count": len(items), "base": base_total, "commission": new_fee,
+            "balance": balance, "outstanding": outstanding, "amount": max(0, balance - outstanding)}
 
 
-def invoice_draft(user_id) -> dict:
-    """پیش‌نویس صورتحساب: سفارش‌های انجام‌شده‌ی بدون صورتحساب و مبلغ پیشنهادی (بدهی باز منهای صورتحساب‌های پرداخت‌نشده)."""
+def invoice_pending_orders(user_id):
+    """سفارش‌های انجام‌شده‌ی این مشتری که هنوز در هیچ صورتحسابی نیامده‌اند."""
     with conn() as c:
-        return _invoice_draft(c, user_id)
+        ids = _account_user_ids(c, user_id)
+        marks = ",".join("?" for _ in ids)
+        rows = c.execute(
+            f"SELECT * FROM orders WHERE user_id IN ({marks}) AND status='done' AND invoice_id IS NULL ORDER BY id", ids
+        ).fetchall()
+    out = []
+    for o in rows:
+        d = json.loads(o["data"])
+        out.append({"id": o["id"], "code": o["code"], "symbol": d.get("symbol", ""),
+                    "base": o["trade_amount"] or _amount_from_data(d)})
+    return out
+
+
+def invoice_quote(user_id, rates):
+    with conn() as c:
+        return _invoice_quote(c, user_id, rates)
 
 
 def account_last_data(user_id) -> dict:
@@ -836,30 +863,33 @@ def account_last_data(user_id) -> dict:
     return json.loads(o["data"]) if o else {}
 
 
-def create_invoice(user_id, text, amount, expected_default, actor_id):
-    """صدور صورتحساب. اگر مبلغ از مبلغ پیشنهادی کمتر باشد، مابه‌التفاوت به‌عنوان تخفیف در حساب مشتری ثبت می‌شود.
+def create_invoice(user_id, text, amount, expected_default, actor_id, rates):
+    """صدور صورتحساب با نرخ‌های داده‌شده: کارمزد هر سفارش (مبلغ × نرخ) روی همان سفارش ثبت می‌شود.
+    اگر مبلغ از مبلغ محاسبه‌شده کمتر باشد، مابه‌التفاوت به‌عنوان تخفیف در حساب مشتری ثبت می‌شود.
     اگر وضعیت حساب از زمان پیش‌نویس تغییر کرده باشد None برمی‌گرداند."""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        d = _invoice_draft(c, user_id)
-        if not d["count"] or d["amount"] <= 0 or d["amount"] != expected_default or not 0 < amount <= d["amount"]:
+        q = _invoice_quote(c, user_id, rates)
+        if not q or not q["count"] or q["amount"] <= 0 or q["amount"] != expected_default or not 0 < amount <= q["amount"]:
             return None
-        discount = d["amount"] - amount
+        discount = q["amount"] - amount
         cur = c.execute(
             "INSERT INTO invoices(user_id,text,amount,discount,order_count,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
-            (user_id, text, amount, discount, d["count"], now(), actor_id),
+            (user_id, text, amount, discount, q["count"], now(), actor_id),
         )
         iid = cur.lastrowid
-        oids = [o["id"] for o in d["orders"]]
-        marks = ",".join("?" for _ in oids)
-        c.execute(f"UPDATE orders SET invoice_id=? WHERE id IN ({marks})", [iid] + oids)
+        for it in q["items"]:
+            c.execute(
+                "UPDATE orders SET invoice_id=?, trade_amount=?, fee_rate=?, commission=?, updated_at=? WHERE id=?",
+                (iid, it["base"], it["rate"], it["fee"], now(), it["order"]["id"]),
+            )
+            _log(c, it["order"]["id"], actor_id, "invoice", f"#{iid} rate={it['rate']} fee={it['fee']}")
         if discount:
             c.execute(
                 "INSERT INTO manual_customer_payments(user_id,amount,note,created_at,actor_id) VALUES(?,?,?,?,?)",
                 (user_id, discount, f"تخفیف صورتحساب #{iid}", now(), actor_id),
             )
-        _log(c, oids[0], actor_id, "invoice", f"#{iid} amount={amount} discount={discount} orders={len(oids)}")
-        return {"id": iid, "amount": amount, "discount": discount, "count": d["count"]}
+        return {"id": iid, "amount": amount, "discount": discount, "count": q["count"], "commission": q["commission"]}
 
 
 def get_invoice(invoice_id):
