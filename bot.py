@@ -169,10 +169,13 @@ def render_order(o, admin=False, reveal=False):
             fee = db.order_fees(o)
             bal = db.customer_summary(o)["balance"]
             lbl = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
-            lines += ["",
-                      f"🧾 کارمزد این سفارش: {fee['commission']:,} تومان "
-                      f"({fee['rate']:g}٪ از {fee['trade_amount']:,})",
-                      f"💰 حساب کل مشتری: {abs(bal):,} تومان ({lbl})"]
+            if o["invoice_id"]:
+                fee_line = (f"🧾 کارمزد این سفارش: {fee['commission']:,} تومان "
+                            f"({fee['rate']:g}٪ از {fee['trade_amount']:,}) — صورتحساب #{o['invoice_id']}")
+            else:
+                fee_line = (f"🧾 مبلغ سفارش: {fee['trade_amount']:,} تومان — "
+                            "نرخ و کارمزد هنگام صدور صورتحساب پرسیده و محاسبه می‌شود")
+            lines += ["", fee_line, f"💰 حساب کل مشتری: {abs(bal):,} تومان ({lbl})"]
         lines += ["", f"👤 تلگرام: {esc(uname)} | id: <code>{o['user_id']}</code>"]
         n_cust = len(db.customer_orders(o))
         if n_cust > 1:
@@ -664,6 +667,8 @@ def invoice_preview(inv):
         "━━━━━━━━━━━━━━\n"
         f"مبلغ قابل پرداخت (ثبت در سیستم): {money(inv['amount'])}"
     )
+    if inv.get("calc"):
+        text += "\n\n🧮 محاسبه (فقط برای شما، به مشتری ارسال نمی‌شود):\n" + "\n".join(inv["calc"])
     if inv["amount"] < inv["default"]:
         text += f"\nتخفیف نسبت به مبلغ پیشنهادی: {money(inv['default'] - inv['amount'])}"
     kb = M(
@@ -677,19 +682,66 @@ def invoice_preview(inv):
 
 
 async def start_invoice(msg, ctx, user_id):
-    d = db.invoice_draft(user_id)
-    if not d["count"] or d["amount"] <= 0:
+    """شروع صدور صورتحساب: ربات برای هر سفارش انجام‌شده‌ی بدون صورتحساب نرخ کارمزد را می‌پرسد."""
+    orders = db.invoice_pending_orders(user_id)
+    if not orders:
         return await msg.reply_text(
-            "چیزی برای صدور صورتحساب نیست: این مشتری سفارش انجام‌شده‌ی بدون صورتحساب و با بدهی باز ندارد."
+            "چیزی برای صدور صورتحساب نیست: این مشتری سفارش انجام‌شده‌ی بدون صورتحساب ندارد."
         )
-    name = db.account_last_data(user_id).get("full_name")
-    inv = {
-        "user_id": user_id, "count": d["count"], "default": d["amount"], "amount": d["amount"],
-        "name": name, "edited": False,
-        "text": invoice_default_text(name, d["count"], d["amount"]),
+    ctx.user_data.clear()
+    ctx.user_data["inv"] = {
+        "user_id": user_id, "name": db.account_last_data(user_id).get("full_name"),
+        "orders": [(o["id"], o["code"], o["symbol"], o["base"]) for o in orders],
+        "i": 0, "rates": {}, "last": None, "edited": False,
     }
+    ctx.user_data["state"] = ("a_inv_rate",)
+    await ask_invoice_rate(msg, ctx)
+
+
+async def ask_invoice_rate(msg, ctx):
+    inv = ctx.user_data["inv"]
+    i, n = inv["i"], len(inv["orders"])
+    _oid, code, sym, base = inv["orders"][i]
+    sugg = db.symbol_rate(sym)
+    if sugg is None:
+        sugg = inv["last"]
+    rows = []
+    if sugg is not None:
+        rows.append([f"✅ {sugg:g}٪"])
+    if inv["last"] is not None and i < n - 1:
+        rows.append([f"🔁 همین نرخ ({inv['last']:g}٪) برای بقیه‌ی سفارش‌ها"])
+    rows.append([BTN_CANCEL])
+    await msg.reply_text(
+        f"🧾 صدور صورتحساب — سفارش {i + 1} از {n}\n"
+        f"کد: {code} | نماد: {sym or '—'}\n"
+        f"مبلغ سفارش: {money(base)}\n\n"
+        "نرخ کارمزد این سفارش را به درصد بفرستید (مثلاً 2):",
+        reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True),
+    )
+
+
+async def finish_invoice_rates(msg, ctx, uid):
+    inv = ctx.user_data["inv"]
+    quote = db.invoice_quote(inv["user_id"], inv["rates"])
     ctx.user_data.pop("state", None)
-    ctx.user_data["inv"] = inv
+    if not quote or not quote["count"]:
+        ctx.user_data.pop("inv", None)
+        return await msg.reply_text("وضعیت سفارش‌ها تغییر کرده؛ دوباره صدور صورتحساب را شروع کنید.", reply_markup=main_kb(uid))
+    if quote["amount"] <= 0:
+        ctx.user_data.pop("inv", None)
+        return await msg.reply_text(
+            f"کارمزد محاسبه‌شده {money(quote['commission'])} است ولی پرداخت‌های قبلی مشتری آن را پوشش می‌دهد؛ صورتحسابی صادر نشد.",
+            reply_markup=main_kb(uid),
+        )
+    inv["count"], inv["default"], inv["amount"] = quote["count"], quote["amount"], quote["amount"]
+    inv["text"] = invoice_default_text(inv["name"], quote["count"], quote["amount"])
+    inv["calc"] = [
+        f"• {it['order']['code']} | {it['symbol'] or '—'}: {it['base']:,} × {it['rate']:g}٪ = {it['fee']:,} تومان"
+        for it in quote["items"]
+    ] + [f"جمع کارمزد: {money(quote['commission'])}"]
+    if quote["amount"] != quote["commission"]:
+        inv["calc"].append(f"پس از کسر پرداخت‌های قبلی / صورتحساب‌های باز: {money(quote['amount'])}")
+    await msg.reply_text("نرخ‌ها ثبت شد ✅", reply_markup=main_kb(uid))
     text, kb = invoice_preview(inv)
     await msg.reply_text(text, reply_markup=kb)
 
@@ -864,7 +916,7 @@ ACT_PERM = {
 }  # fmt: skip
 STATE_PERM = {
     "a_search": "view", "a_edit": "edit", "a_note": "note", "a_paid": "pay", "a_user_paid": "pay", "a_rc_amount": "pay",
-    "a_symrate": "rates", "a_inv_text": "pay", "a_inv_amt": "pay",
+    "a_symrate": "rates", "a_inv_text": "pay", "a_inv_amt": "pay", "a_inv_rate": "pay",
     "a_cap_set": "cap", "a_rate": "cap", "a_faq_add_q": "faq", "a_faq_add_a": "faq",
     "a_faq_edit": "faq", "a_restore": "backup", "a_restore_confirm": "backup",
     "a_bc": "broadcast", "a_bc_confirm": "broadcast",
@@ -1200,9 +1252,7 @@ async def admin_cb(q, ctx, p):
                 )
             res = db.complete_order(oid, amount, uid)
             if not res:
-                return await q.message.reply_text(
-                    "⚠️ نرخ کارمزد این نماد ثبت نشده است. از «💹 نرخ کارمزد سهام‌ها ← ➕ نرخ نماد» نرخ را ثبت کنید و دوباره وضعیت را تغییر دهید."
-                )
+                return await q.message.reply_text("⚠️ ثبت انجام سفارش ناموفق بود.")
             o = db.get_order(oid)
         else:
             db.set_status(oid, status, uid)
@@ -1368,11 +1418,11 @@ async def admin_cb(q, ctx, p):
                 reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
             )
         else:  # invy
-            res = db.create_invoice(inv["user_id"], inv["text"], inv["amount"], inv["default"], uid)
+            res = db.create_invoice(inv["user_id"], inv["text"], inv["amount"], inv["default"], uid, inv["rates"])
             if not res:
                 ctx.user_data.pop("inv", None)
                 return await q.message.reply_text(
-                    "وضعیت حساب مشتری از زمان تهیه‌ی پیش‌نویس تغییر کرده است؛ لطفاً صدور صورتحساب را دوباره شروع کنید."
+                    "وضعیت حساب یا سفارش‌های مشتری از زمان تهیه‌ی پیش‌نویس تغییر کرده است؛ لطفاً صدور صورتحساب را دوباره شروع کنید."
                 )
             ctx.user_data.pop("inv", None)
             try:
@@ -1794,6 +1844,33 @@ async def admin_text(update, ctx, raw, st):
         ctx.user_data.clear()
         await msg.reply_text("در حال ثبت…", reply_markup=main_kb(uid))
         await finish_approval(msg, ctx, st[1], int(v), uid)
+
+    elif kind == "a_inv_rate":
+        inv = ctx.user_data.get("inv")
+        if not inv:
+            ctx.user_data.clear()
+            return await msg.reply_text("درخواست منقضی شده؛ دوباره صدور صورتحساب را شروع کنید.", reply_markup=main_kb(uid))
+        i = inv["i"]
+        if raw.startswith("🔁"):
+            if inv["last"] is None:
+                return await msg.reply_text("هنوز نرخی وارد نشده است.")
+            for oid, *_ in inv["orders"][i:]:
+                inv["rates"][oid] = inv["last"]
+            inv["i"] = len(inv["orders"])
+        else:
+            v = fa2en(raw).replace("✅", "").replace("٪", "").replace("%", "").replace("٫", ".").replace("/", ".").strip()
+            try:
+                pct = float(v)
+            except ValueError:
+                pct = -1
+            if not 0 < pct <= 100:
+                return await msg.reply_text("لطفاً درصد کارمزد را به‌صورت عدد بین ۰ تا ۱۰۰ بفرستید (مثلاً 2).")
+            inv["rates"][inv["orders"][i][0]] = pct
+            inv["last"] = pct
+            inv["i"] = i + 1
+        if inv["i"] < len(inv["orders"]):
+            return await ask_invoice_rate(msg, ctx)
+        await finish_invoice_rates(msg, ctx, uid)
 
     elif kind == "a_inv_text":
         inv = ctx.user_data.get("inv")
