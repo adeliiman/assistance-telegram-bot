@@ -83,6 +83,17 @@ def fmt_time(iso: str) -> str:
     return datetime.fromisoformat(iso).astimezone(TZ).strftime("%Y-%m-%d %H:%M")
 
 
+def fix_percent(text: str) -> str:
+    """علامت درصد را با نوع ارقام هماهنگ می‌کند: بعد از ارقام انگلیسی «%» و بعد از ارقام فارسی/عربی «٪»."""
+    text = re.sub(r"(?<=[0-9])٪", "%", text)
+    return re.sub(r"(?<=[۰-۹٠-٩])%", "٪", text)
+
+
+def fmt_pct(x) -> str:
+    """درصد با ارقام انگلیسی و علامت انگلیسی: 2 ← 2% ، 3.5 ← 3.5%"""
+    return f"{x:g}%"
+
+
 def fmt_num(v) -> str:
     """عدد با جداکننده‌ی سه‌رقمی: 100000000 ← 100,000,000"""
     try:
@@ -171,7 +182,7 @@ def render_order(o, admin=False, reveal=False):
             lbl = "بدهکار" if bal > 0 else "بستانکار" if bal < 0 else "تسویه"
             if o["invoice_id"]:
                 fee_line = (f"🧾 کارمزد این سفارش: {fee['commission']:,} تومان "
-                            f"({fee['rate']:g}٪ از {fee['trade_amount']:,}) — صورتحساب #{o['invoice_id']}")
+                            f"({fmt_pct(fee['rate'])} از {fee['trade_amount']:,}) — صورتحساب #{o['invoice_id']}")
             else:
                 fee_line = (f"🧾 مبلغ سفارش: {fee['trade_amount']:,} تومان — "
                             "نرخ و کارمزد هنگام صدور صورتحساب پرسیده و محاسبه می‌شود")
@@ -220,7 +231,7 @@ def intake_text() -> str:
         f"ظرفیت: {cap}\n"
         f"ثبت‌شده تاکنون: {s['used']}\n"
         f"باقی‌مانده: {rem}\n"
-        f"نرخ کارمزد پیش‌فرض: {db.get_commission_percent():g}٪\n\n"
+        "\n"
         "ℹ️ ظرفیت یعنی سقف کل سفارش‌ها؛ شمارش ریست نمی‌شود و سفارش‌های قبلی هم حساب می‌شوند. "
         "سفارش‌های خطادار در ظرفیت حساب نمی‌شوند."
     )
@@ -233,7 +244,6 @@ def intake_kb():
         [
             [B(toggle, callback_data="a:captog")],
             [B("🔢 تنظیم ظرفیت", callback_data="a:capset")],
-            [B("🧾 نرخ کارمزد", callback_data="a:rate")],
             [B("🏠 پنل", callback_data="a:home")],
         ]
     )
@@ -273,9 +283,7 @@ DEFAULT_PREFIX = "↩️ همان قبلی:"
 
 
 def default_for(ctx, f):
-    """مقدار قبلی/ذخیره‌شده‌ی یک فیلد برای پیشنهاد (رمز هرگز پیشنهاد نمی‌شود)."""
-    if f["kind"] == "secret":
-        return None
+    """مقدار قبلی/ذخیره‌شده‌ی یک فیلد برای پیشنهاد (رمز هم؛ ولی همیشه به‌صورت •••••• نمایش داده می‌شود)."""
     ud = ctx.user_data
     return (ud.get("form") or {}).get(f["key"]) or (ud.get("defaults") or {}).get(f["key"]) or None
 
@@ -466,14 +474,7 @@ async def send_fin(msg, uid):
 
 def rates_lines():
     """فهرست نرخ نمادها؛ همین فهرست هم به مشتری و هم به مدیر نشان داده می‌شود."""
-    lines = [f"• {sym}: {rate:g}٪" for sym, rate in db.list_symbol_rates()]
-    default = db.get_commission_percent()
-    if default > 0:
-        if lines:
-            lines.append("")
-            lines.append(f"سایر نمادها: {default:g}٪")
-        else:
-            lines.append(f"نرخ کارمزد همه‌ی نمادها: {default:g}٪")
+    lines = [f"• {sym}: {fmt_pct(rate)}" for sym, rate in db.list_symbol_rates()]
     return lines
 
 
@@ -707,9 +708,9 @@ async def ask_invoice_rate(msg, ctx):
         sugg = inv["last"]
     rows = []
     if sugg is not None:
-        rows.append([f"✅ {sugg:g}٪"])
+        rows.append([f"✅ {fmt_pct(sugg)}"])
     if inv["last"] is not None and i < n - 1:
-        rows.append([f"🔁 همین نرخ ({inv['last']:g}٪) برای بقیه‌ی سفارش‌ها"])
+        rows.append([f"🔁 همین نرخ ({fmt_pct(inv['last'])}) برای بقیه‌ی سفارش‌ها"])
     rows.append([BTN_CANCEL])
     await msg.reply_text(
         f"🧾 صدور صورتحساب — سفارش {i + 1} از {n}\n"
@@ -736,7 +737,7 @@ async def finish_invoice_rates(msg, ctx, uid):
     inv["count"], inv["default"], inv["amount"] = quote["count"], quote["amount"], quote["amount"]
     inv["text"] = invoice_default_text(inv["name"], quote["count"], quote["amount"])
     inv["calc"] = [
-        f"• {it['order']['code']} | {it['symbol'] or '—'}: {it['base']:,} × {it['rate']:g}٪ = {it['fee']:,} تومان"
+        f"• {it['order']['code']} | {it['symbol'] or '—'}: {it['base']:,} × {fmt_pct(it['rate'])} = {it['fee']:,} تومان"
         for it in quote["items"]
     ] + [f"جمع کارمزد: {money(quote['commission'])}"]
     if quote["amount"] != quote["commission"]:
@@ -1455,7 +1456,7 @@ async def admin_cb(q, ctx, p):
     elif act == "rate":
         ctx.user_data["state"] = ("a_rate",)
         await q.message.reply_text(
-            f"نرخ فعلی کارمزد: {db.get_commission_percent():g}٪\n"
+            f"نرخ فعلی کارمزد: {fmt_pct(db.get_commission_percent())}\n"
             "نرخ پیش‌فرض را به درصد بفرستید (مثلاً 0.5). این نرخ زمانی استفاده می‌شود "
             "که برای نماد سفارش نرخ اختصاصی ثبت نشده باشد.",
             reply_markup=ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True),
@@ -1822,7 +1823,7 @@ async def admin_text(update, ctx, raw, st):
             return await msg.reply_text("فرمت صحیح: نام نماد و درصد. مثال: فولاد 2")
         db.set_symbol_rate(sym, pct)
         ctx.user_data.clear()
-        await msg.reply_text(f"نرخ کارمزد {esc(sym)} با مقدار {pct:g}٪ ذخیره شد ✅", parse_mode="HTML", reply_markup=main_kb(uid))
+        await msg.reply_text(f"نرخ کارمزد {esc(sym)} با مقدار {fmt_pct(pct)} ذخیره شد ✅", parse_mode="HTML", reply_markup=main_kb(uid))
 
     elif kind == "a_rate":
         v = fa2en(raw).replace("٪", "").replace("%", "").replace("٫", ".").replace("/", ".").strip()
@@ -1879,7 +1880,7 @@ async def admin_text(update, ctx, raw, st):
             return await msg.reply_text("درخواست منقضی شده؛ دوباره صدور صورتحساب را شروع کنید.", reply_markup=main_kb(uid))
         if not raw or len(raw) > 3000:
             return await msg.reply_text("متن خالی یا بیش از ۳۰۰۰ کاراکتر است.")
-        inv["text"], inv["edited"] = raw, True
+        inv["text"], inv["edited"] = fix_percent(raw), True
         ctx.user_data.pop("state", None)
         await msg.reply_text("متن ثبت شد ✅", reply_markup=main_kb(uid))
         text, kb = invoice_preview(inv)
@@ -1907,7 +1908,7 @@ async def admin_text(update, ctx, raw, st):
     elif kind == "a_bc":
         if not raw or len(raw) > 3500:
             return await msg.reply_text("متن خالی یا بیش از ۳۵۰۰ کاراکتر است.")
-        ctx.user_data["state"] = ("a_bc_confirm", raw)
+        ctx.user_data["state"] = ("a_bc_confirm", fix_percent(raw))
         _, active = db.user_counts(all_staff())
         kb = M(
             [[B(f"✅ ارسال به {active} نفر", callback_data="a:bcy"), B("❌ لغو", callback_data="a:bcc")]]
@@ -2031,7 +2032,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not o or o["user_id"] != uid:
                 return
             old = json.loads(o["data"])
-            data = {f["key"]: old[f["key"]] for f in config.FORM_FIELDS if f["kind"] != "secret" and old.get(f["key"])}
+            data = {f["key"]: old[f["key"]] for f in config.FORM_FIELDS if old.get(f["key"])}
             return await begin_form(q.message, ctx, form=data, skip=data.keys(), defaults=data)
         return
 
