@@ -213,7 +213,8 @@ def list_symbol_rates():
 
 
 def complete_order(order_id, amount: int, actor_id):
-    """تکمیل سفارش و محاسبه خودکار کارمزد از نرخ همان نماد یا نرخ پیش‌فرض."""
+    """ثبت «انجام شد» و مبلغ سفارش. کارمزد اینجا محاسبه نمی‌شود؛ نرخ فقط هنگام صدور صورتحساب
+    توسط مالک پرسیده می‌شود و همان‌جا محاسبه و روی سفارش ثبت می‌شود."""
     if amount <= 0:
         return None
     with conn() as c:
@@ -222,17 +223,12 @@ def complete_order(order_id, amount: int, actor_id):
         if not o:
             return None
         sym = json.loads(o["data"]).get("symbol", "").strip()
-        rate = _rate_for(c, sym)  # فقط پیشنهاد اولیه؛ نرخ نهایی هنگام صدور صورتحساب پرسیده می‌شود
-        fee = round(amount * rate / 100) if rate > 0 else 0
         c.execute(
-            "UPDATE orders SET status='done', trade_amount=?, fee_rate=?, commission=?, updated_at=? WHERE id=?",
-            (amount, rate if rate > 0 else None, fee, now(), order_id),
+            "UPDATE orders SET status='done', trade_amount=?, fee_rate=NULL, commission=NULL, updated_at=? WHERE id=?",
+            (amount, now(), order_id),
         )
-        _log(c, order_id, actor_id, "done", f"amount={amount} rate={rate} fee={fee}")
-        return {
-            "code": o["code"], "user_id": o["user_id"], "symbol": sym,
-            "amount": amount, "rate": rate, "fee": fee,
-        }
+        _log(c, order_id, actor_id, "done", f"amount={amount}")
+        return {"code": o["code"], "user_id": o["user_id"], "symbol": sym, "amount": amount}
 
 
 # ---------------- settings / capacity ----------------
@@ -460,14 +456,11 @@ def set_field(order_id, key, value, actor_id):
         )
         _log(c, order_id, actor_id, "edit", f"{key}: {old!r} -> {value!r}")
         if row["status"] == "done" and key in ("buying_power", "symbol"):
-            amount, rate = _amount_from_data(data), _rate_for(c, data.get("symbol", ""))
-            if amount > 0 and rate > 0:  # کارمزد ذخیره‌شده با مبلغ/نماد جدید هماهنگ شود
-                fee = round(amount * rate / 100)
+            amount = _amount_from_data(data)  # فقط مبلغ سفارش به‌روز می‌شود؛ کارمزد خودکار نداریم
+            if amount > 0:
                 c.execute(
-                    "UPDATE orders SET trade_amount=?, fee_rate=?, commission=? WHERE id=?",
-                    (amount, rate, fee, order_id),
+                    "UPDATE orders SET trade_amount=? WHERE id=? AND invoice_id IS NULL", (amount, order_id)
                 )
-                _log(c, order_id, actor_id, "fee_recalc", f"amount={amount} rate={rate} fee={fee}")
 
 
 # ---------------- payment & commission ----------------
